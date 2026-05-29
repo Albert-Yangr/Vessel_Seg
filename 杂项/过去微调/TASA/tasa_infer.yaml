@@ -1,0 +1,83 @@
+# @package _global_
+defaults:
+  - /hydra: default
+  - /model: dyn_unet_base  # 🔥 继承大模型的架构参数
+  - _self_
+
+# ==========================================
+# 🌟 TASA 专家模块配置
+# ==========================================
+expert_type: "snake"
+
+
+seed: 42
+# --- 多卡配置 ---
+gpus: [4,5,0,2,3]
+
+# --- 评估开关 ---
+evaluate: true
+
+# --- 输入输出路径配置 ---
+image_path:  auto
+output_folder: null
+sign: "TASA_Infer"
+
+# --- 模型权重 ---
+ckpt_path: /home/yangrui/Project/Base-model/local_results/checkpoints/CAS2023/CAS2023-S/TASA-蛇形卷积2_CAS2023_SNAKE/TASA-SOTA-143-0.8692.ckpt
+
+
+
+# --- 文件名匹配规则 ---
+image_file_ending: .img.nii.gz
+mask_suffix: .label.nii.gz
+mask_path: "auto"
+file_app: ""
+round_to: 4
+strict_matching: true
+
+# ==========================================
+# 🚀 高级推理配置 (集成原 test 文件的所有模块)
+# ==========================================
+# --- 滑动窗口设置 ---
+batch_size: 1
+patch_size: [128, 128, 128]
+overlap: 0.5
+mode: "gaussian"
+sigma_scale: 0.125
+padding_mode: "constant"
+
+# --- TTA (Test-Time Augmentation) 测试时增强 ---
+tta:
+  scales: [1.0] # 示例: [0.75, 1.0, 1.25]
+  invert: false
+  invert_mean_thresh: 0.5
+  equalize_hist: false
+  hist_bins: 100
+
+# --- 融合参数 ---
+merging:
+  max: false
+  threshold: 0.5
+
+# --- 🔥 后处理 (Post-Processing) 模块 ---
+post:
+  apply: false                   # 开启后处理
+  small_objects_min_size: 400    # 移除体积小于该值(体素)的孤立噪点
+  keep_largest_vessels: false   # 是否只保留最大连通域
+  num_largest_vessels: 1
+  keep_closest_vessels: false
+  num_closest_vessels: 1
+
+
+# 标准预处理变换管道
+transforms_config:
+  - EnsureChannelFirst:
+      channel_dim: "no_channel"
+  - ScaleIntensityRangePercentiles:
+      lower: 2
+      upper: 98
+      b_min: 0
+      b_max: 1
+      clip: false
+  - ToTensor:
+      device: null

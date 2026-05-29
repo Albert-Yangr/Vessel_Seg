@@ -1,0 +1,52 @@
+# 默认配置继承链
+# 使用 Hydra 的默认值机制，按顺序加载 fine-tuning.yaml 和 eval_smile.yaml 中的配置
+defaults:
+  - fine-tuning
+  - override data: test_imageCAS  # 添加 override 关键字
+  - _self_         # 当前文件的配置拥有最高优先级
+
+# 实验参数配置
+num_shots: 10        # 零样本模式：直接使用预训练模型进行推理，不进行微调
+lr: 0.00001         # 学习率设置（10^-5），适用于零样本评估的优化器初始化
+devices: [0]        # 使用单个 GPU（设备索引 0）进行计算
+run_name: imageCAS_ROI  # 实验运行名称，用于日志记录和模型保存路径标识
+
+# 路径配置（需要用户修改）
+path_to_chkpt: /home/yangrui/Project/Base-models/local_results/checkpoints/base.pt # TODO: 预训练模型权重文件路径
+chkpt_folder: /home/yangrui/Project/Base-models/local_results/checkpoints # TODO: 检查点保存目录
+
+# 数据加载器配置
+dataloader:
+  shuffle: False    # 验证/测试阶段不需要打乱数据顺序，确保结果可复现
+
+# 训练器配置（对应 PyTorch Lightning Trainer）
+trainer:
+  lightning_trainer:
+    val_check_interval: 200  # 每训练 200 步进行一次验证集评估
+    max_steps: 4000          # 最大训练步数（零样本模式下主要用于控制评估频率）
+    max_epochs: 1            # 最大训练轮数（设置为 1 确保快速完成评估流程）
+
+  # Lightning 模块配置（专门用于微调/评估的模块）
+  lightning_module:
+    _target_: utils.model.PLModuleFinetune  # 使用微调专用的模块类
+    _partial_: True          # 部分实例化，等待其他参数注入
+    prediction_threshold: 0.62  # 二值化分割阈值，大于此值的概率会被判定为血管
+    batch_size: ${batch_size}    # 批大小（从继承的配置中获取）
+    input_size: ${input_size}    # 输入尺寸（从继承的配置中获取）
+
+    # 学习率调度器配置（零样本模式下主要调度器被禁用）
+    scheduler_configs:
+      # 少样本微调专用的余弦退火调度器（零样本时基本不生效）
+      cosine_annealing_few:
+        interval: step           # 按训练步数进行调度
+        frequency: 10            # 调度频率
+        scheduler:
+          _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          _partial_: True
+          T_max: 1000            # 余弦周期长度
+          eta_min: 0.0000001     # 最小学习率（10^-7）
+          last_epoch: -1         # 初始 epoch 设置
+
+      # 标准训练调度器（零样本模式下设为 null 表示禁用）
+      linear_warmup: null        # 线性预热调度器（不启用）
+      cosine_annealing: null      # 标准余弦退火调度器（不启用）

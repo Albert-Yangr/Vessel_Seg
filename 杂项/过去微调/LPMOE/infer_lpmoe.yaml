@@ -1,0 +1,81 @@
+# @package _global_
+defaults:
+  - /hydra: default
+  - _self_
+
+# --- 多卡配置 ---
+gpus: [0,1,2,3]
+
+# --- 【评估模式配置】 ---
+# True:  计算所有评估指标 (Dice, clDice, NSD, ASD 等)，并保存 CSV 详细报告。
+# False: 仅计算基础指标 (Dice, clDice)，在控制台打印结果，**不保存** CSV 报告。
+# 注意：无论 True/False，都需要目录下有对应的 label 文件才能计算。
+evaluate: true
+
+# --- 输入输出路径配置 (支持 auto) ---
+# auto 模式下会根据 ckpt_path 自动推导
+image_path: /home/yangrui/Project/Base-model/datasets/imageCAS/imageCAS-ROI/test
+output_folder: null
+
+
+shot_name: "lpmoe_point"
+seed: 42
+
+
+
+# --- 模型权重 (改为你的 LPMoE 微调权重路径) ---
+ckpt_path: /home/yangrui/Project/Base-model/local_results/checkpoints/imageCAS/imageCAS-ROI/少样本3正常标签/基础损失-顺序标签3_imageCAS-few/epoch:31-step:9600-dice:0.7351.ckpt
+
+
+# --- 文件名匹配规则 ---
+image_file_ending: .img.nii.gz
+mask_suffix: .label.nii.gz
+mask_path: "auto"
+
+file_app: ""
+round_to: 2
+strict_matching: true
+
+# --- 滑动窗口设置 ---
+batch_size: 2
+patch_size: [128, 128, 128]
+overlap: 0.5
+mode: "gaussian" # LPMoE 建议使用 gaussian 融合
+sigma_scale: 0.125
+padding_mode: "constant"
+
+# 后处理配置
+post:
+  apply: true
+  small_objects_min_size: 400
+  small_objects_connectivity: 1 # 1=6邻域, 2=18邻域, 3=26邻域
+  keep_largest_vessels: false
+  num_largest_vessels: 6
+  keep_closest_vessels: false
+  num_closest_vessels: 3
+
+# 测试时增强配置 (可选)
+tta:
+  scales: [1]
+  invert: false
+  invert_mean_thresh: 0.5
+  equalize_hist: false
+  hist_bins: 100
+
+# 标准预处理变换管道
+transforms_config:
+  - EnsureChannelFirst:
+      channel_dim: "no_channel"
+  - ScaleIntensityRangePercentiles:
+      lower: 1
+      upper: 99
+      b_min: 0
+      b_max: 1
+      clip: true
+  - ToTensor:
+      device: null
+
+# 融合配置
+merging:
+  threshold: 0.5
+  max: false

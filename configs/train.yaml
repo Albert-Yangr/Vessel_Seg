@@ -1,0 +1,44 @@
+# 默认配置继承 - 模块化配置管理
+defaults:
+  - data: real_drand_flow      # 使用真实数据流的数据配置
+  - trainer: default           # 使用默认训练器配置
+  - model: dyn_unet_base       # 使用动态UNet基础模型架构
+  - hydra: default             # Hydra框架默认配置
+  - _self_                     # 包含当前文件自身的配置
+
+# ==================== 数据配置部分 ====================
+# 输入数据规格设置
+input_size: [128, 128, 128]    # 3D输入体积尺寸：128×128×128体素
+image_channels: 1              # 单通道图像（灰度图）
+num_classes: 1                 # 单类别分割任务（二值分割）
+
+# ==================== 训练参数配置 ====================
+# 训练过程核心参数
+seed: 404                      # 随机种子，确保实验可复现性
+lr: 0.0001                     # 学习率：0.0001，适合微调任务
+batch_size: 2                  # 批次大小：4，平衡内存和训练稳定性
+eval_path: /path/to/eval_set_pretrain #TODO 预训练评估集路径（需填写实际路径）
+path_to_chkpt: null            # 预训练检查点路径：null表示从零开始训练
+
+# ==================== 显卡使用数量 ====================
+
+devices: [0,1,2,3]                   # 使用GPU设备编号：单卡训练，使用第0号GPU
+
+# ==================== 日志与监控配置 ====================
+# 实验跟踪和结果记录
+run_name: Base-model             # 实验运行名称标识
+wandb_project: Base-model        # Weights & Biases项目名称
+chkpt_folder: /home/yangrui/Project/Base-model/checkpoints #TODO 模型检查点保存目录（需填写实际路径）
+offline: False                 # W&B在线模式：False表示实时同步到云端服务器
+
+# ==================== 数据加载器优化配置 ====================
+# 高性能数据加载设置
+dataloader:
+  _target_: "torch.utils.data.DataLoader"  # 使用PyTorch标准数据加载器
+  _partial_: True              # 部分实例化，允许后续参数覆盖
+  num_workers: 16              # 数据加载工作进程数：16，充分利用多核CPU
+  prefetch_factor: 3           # 预取因子：每个worker预取3个批次
+  batch_size: ${batch_size}    # 引用上面定义的batch_size变量
+  pin_memory: True            # 固定内存：加速GPU数据传输
+  persistent_workers: True     # 持久化worker：避免每个epoch重新创建worker
+  shuffle: True               # 数据打乱：训练时启用，增强泛化能力

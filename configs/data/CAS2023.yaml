@@ -1,0 +1,9 @@
+defaults:
+  - default_finetune@CAS2023
+  - _self_
+
+CAS2023:
+  sample_prop: 1
+  path: /home/yangrui/Project/Base-model/datasets/CAS2023/CAS2023-refile
+
+

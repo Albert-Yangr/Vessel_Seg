@@ -1,0 +1,72 @@
+# @package _global_
+defaults:
+  - /trainer: default
+  - /hydra: default
+  - /model: dyn_unet_base
+  - /data: CAS2023
+  - _self_
+
+# === 基础信息 ===
+data_name: CAS2023
+loss_name: 双分支-test
+seed: 43
+
+# === 路径与权重 ===
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+path_to_chkpt: null
+resume_ckpt_path: null
+
+
+# === 核心超参数 ===
+label_suffix: ".slice.nii.gz"
+input_size: [128, 128, 128]
+val_frequency: 2000
+batch_size: 2
+repeats: 10
+ramp_epochs: 100
+pseudo_weight: 0.5
+
+# === 优化器与损失函数 ===
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+loss_configs:
+
+  label_loss:
+    _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+  slice_loss:
+    _target_: utils.dual_branch.simple_loss.SparseSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+    affinity_weight: 0
+    tv_weight: 0
+    ignore_index: 255
+  pseudo_loss:
+    _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+
+# === 训练器底层配置 ===
+trainer:
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True
+    max_epochs: 100
+    max_time: "00:48:00:00"
+    max_steps: -1
+    accelerator: gpu
+    devices: [5]
+    precision: 16-mixed
+    check_val_every_n_epoch: null
+    num_sanity_val_steps: 0
+
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  num_workers: 8
+  batch_size: ${batch_size}
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 3
