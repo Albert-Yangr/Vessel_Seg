@@ -11,13 +11,16 @@ from utils.dual_branch.simple_loss import SparseSliceLoss
 # =========================================================================
 class ComponentAdaptivePatchContrastiveLoss(nn.Module):
     """
-    Component-aware adaptive 2D patch contrastive learning.
+    连通域形态感知的自适应 2D ROI 对比学习。
 
-    For each sampled vessel anchor, it finds the 2D connected component that contains the anchor on
-    the selected slice, builds the component's rectangular bbox, expands it with context, then
-    resamples that arbitrary HxW ROI to a fixed resolution. This is intentionally ROI-like: long
-    brain-vessel components stay long before resampling, large pulmonary blobs can be fully covered,
-    and coronary dot-like components naturally collapse to small local ROIs.
+    对每个采样到的血管锚点：
+      1. 先在对应 2D 切片上找到包含该锚点的完整连通域；
+      2. 用矩形包围盒框住这个连通域；
+      3. 根据 margin_ratio / min_margin / max_margin 向外扩一圈上下文；
+      4. 将任意长宽比的 ROI 重采样到 roi_size x roi_size；
+      5. 在这个 ROI 内做宏观原型对比和框内微观对比。
+
+    这样做的目标是避免固定正方形小框无法覆盖长条状脑血管或肺部大团块的问题。
     """
 
     def __init__(self, cfg):
@@ -51,6 +54,12 @@ class ComponentAdaptivePatchContrastiveLoss(nn.Module):
         self.register_buffer("bg_proto", F.normalize(torch.randn(self.feat_dim), dim=0))
 
     def _dynamic_temp_from_margin(self, pos_sim, neg_sim):
+        """
+        根据正负相似度差距动态调节 InfoNCE 温度。
+
+        正负差距越大，说明样本越可靠，使用更低温度强化区分；
+        正负差距越小，说明样本越不确定，使用更高温度降低梯度冲击。
+        """
         if not self.dynamic_temperature:
             return torch.full_like(pos_sim, self.temperature)
 
@@ -149,6 +158,13 @@ class ComponentAdaptivePatchContrastiveLoss(nn.Module):
         return comp & (fg4[0, 0] > 0)
 
     def _component_crop(self, feat2d, mask2d, ay, ax):
+        """
+        自适应 ROI 裁剪核心。
+
+        输入一个 2D 特征图、2D mask 和锚点坐标，先 flood-fill 找到该锚点所属
+        连通域，再生成包围盒并重采样到固定 roi_size。如果连通域太小、太大、
+        或重采样后前景太少，则退回固定大小小框。
+        """
         _, H, W = feat2d.shape
         if self.search_size and self.search_size > 0:
             half = self.search_size // 2
@@ -301,6 +317,15 @@ class ComponentAdaptivePatchContrastiveLoss(nn.Module):
         return b_mask_flat.bool() & near
 
     def compute_macro_micro_loss(self, v_feats_list, v_masks_list, b_feats_list, b_masks_list):
+        """
+        计算两级对比损失。
+
+        macro loss：
+          小框内前景/背景平均特征与全局 EMA 原型做 InfoNCE。
+
+        micro loss：
+          在血管小框内部，用血管平均特征作为 anchor，排斥紧邻血管边界的背景难例。
+        """
         device = self.vessel_proto.device
         macro_loss = torch.tensor(0.0, device=device)
         micro_loss = torch.tensor(0.0, device=device)
@@ -371,11 +396,23 @@ class ComponentAdaptivePatchContrastiveLoss(nn.Module):
         return self.compute_macro_micro_loss(v_f, v_m, b_f, b_m)
 
 
-# =========================================================================
-# 🌟 完全原版的双分支包装器 (100% 还原基线)
-# (已剥离所有多余的伪标签置信度魔改，仅保留最基础的截断逻辑)
-# =========================================================================
 class DualBranchLoss(nn.Module):
+    """
+    动态自适应小框对比学习版本的总损失。
+
+    这个类负责把三类训练信号合成最终 loss：
+      1. 真实切片弱监督损失 loss_sup；
+      2. 双分支 CPS 伪标签损失 loss_ps；
+      3. 连通域自适应 ROI 对比学习损失 loss_cl。
+
+    所有实验开关都来自配置文件，而不是靠复制多个 loss 文件切换：
+      - pseudo_label_mode: hard / soft，控制 CPS 伪标签是硬标签还是软标签；
+      - ramp_epochs: 0 表示关闭 ramp-up，否则伪标签损失逐步升权；
+      - contrastive.enable: 是否启用对比学习；
+      - contrastive.dynamic_temperature: 是否启用动态 InfoNCE 温度；
+      - contrastive.pseudo_confidence / max_branch_diff 等参数控制无标签 CL 的可靠选框。
+    """
+
     def __init__(self, base_sup_loss, pseudo_loss_fn, cl_cfg=None, ramp_epochs=50, max_pseudo_weight=0.5,
                  pseudo_label_mode="hard"):
         super().__init__()
@@ -385,19 +422,24 @@ class DualBranchLoss(nn.Module):
         self.max_pseudo_weight = max_pseudo_weight
         self.pseudo_label_mode = str(pseudo_label_mode).lower()
 
-        self.cl_cfg = cl_cfg
-        self.enable_cl = cl_cfg.get("enable", False) if cl_cfg else False
-        cfg_for_pseudo = cl_cfg or {}
-        self.pseudo_confidence = float(cfg_for_pseudo.get("pseudo_confidence", 0.75))
-        self.use_reliable_agreement = bool(cfg_for_pseudo.get("use_reliable_agreement", True))
-        self.max_branch_diff = float(cfg_for_pseudo.get("max_branch_diff", 0.2))
-        self.min_fg_prob = float(cfg_for_pseudo.get("min_fg_prob", self.pseudo_confidence))
-        self.max_bg_prob = float(cfg_for_pseudo.get("max_bg_prob", 1.0 - self.pseudo_confidence))
+        self.cl_cfg = cl_cfg or {}
+        self.enable_cl = bool(self.cl_cfg.get("enable", False))
+        self.ignore_index = int(self.cl_cfg.get("ignore_index", getattr(base_sup_loss, "ignore_index", 255)))
+
+        self.pseudo_confidence = float(self.cl_cfg.get("pseudo_confidence", 0.75))
+        self.use_reliable_agreement = bool(self.cl_cfg.get("use_reliable_agreement", True))
+        self.max_branch_diff = float(self.cl_cfg.get("max_branch_diff", 0.2))
+        self.min_fg_prob = float(self.cl_cfg.get("min_fg_prob", self.pseudo_confidence))
+        self.max_bg_prob = float(self.cl_cfg.get("max_bg_prob", 1.0 - self.pseudo_confidence))
 
         if self.enable_cl:
-            self.cl_loss_fn = ComponentAdaptivePatchContrastiveLoss(cl_cfg)
-            self.cl_weight = float(cl_cfg.get("weight", 0.2))
-            self.warmup = int(cl_cfg.get("warmup_epochs", 20))
+            self.cl_loss_fn = ComponentAdaptivePatchContrastiveLoss(self.cl_cfg)
+            self.cl_weight = float(self.cl_cfg.get("weight", 0.2))
+            self.warmup = int(self.cl_cfg.get("warmup_epochs", 20))
+        else:
+            self.cl_loss_fn = None
+            self.cl_weight = 0.0
+            self.warmup = 0
 
     def sigmoid_rampup(self, current, rampup_length):
         if rampup_length <= 0:
@@ -406,33 +448,10 @@ class DualBranchLoss(nn.Module):
         phase = 1.0 - current / rampup_length
         return float(np.exp(-5.0 * phase * phase))
 
-    def _make_pseudo_and_reliable_masks(self, pred1_u, pred2_u):
-        prob1 = torch.sigmoid(pred1_u)
-        prob2 = torch.sigmoid(pred2_u)
-        avg_prob = 0.5 * (prob1 + prob2)
-        diff = torch.abs(prob1 - prob2)
-
-        pseudo = (avg_prob > 0.5).float()
-        fg_reliable = avg_prob >= self.min_fg_prob
-        bg_reliable = avg_prob <= self.max_bg_prob
-        reliable = fg_reliable | bg_reliable
-
-        if self.use_reliable_agreement:
-            agreement = (prob1 > 0.5) == (prob2 > 0.5)
-            reliable = reliable & agreement
-
-        if self.max_branch_diff is not None and self.max_branch_diff >= 0:
-            reliable = reliable & (diff <= self.max_branch_diff)
-
-        pseudo_mask = pseudo.clone()
-        pseudo_mask[~reliable] = 255
-        return pseudo, pseudo_mask
-
-    def _pseudo_loss_targets(self, pred1_u, pred2_u):
-        prob1 = torch.sigmoid(pred1_u)
-        prob2 = torch.sigmoid(pred2_u)
-        pseudo_1 = (prob1 > 0.5).float()
-        pseudo_2 = (prob2 > 0.5).float()
+    def _pseudo_targets(self, pred1, pred2):
+        """根据配置生成 CPS 伪标签目标。"""
+        prob1 = torch.sigmoid(pred1)
+        prob2 = torch.sigmoid(pred2)
 
         if self.pseudo_label_mode == "soft":
             alpha = torch.rand(
@@ -441,98 +460,112 @@ class DualBranchLoss(nn.Module):
                 dtype=prob1.dtype,
             )
             pseudo_mix = alpha * prob1 + (1.0 - alpha) * prob2
-            loss_target_1 = pseudo_mix
-            loss_target_2 = pseudo_mix
-        else:
-            loss_target_1 = pseudo_2
-            loss_target_2 = pseudo_1
+            return pseudo_mix, pseudo_mix
 
-        return loss_target_1, loss_target_2
+        return (prob2 > 0.5).float(), (prob1 > 0.5).float()
+
+    def _pseudo_loss_pair(self, pred1, pred2, valid_mask=None):
+        """
+        计算两个分支之间的 CPS 伪标签损失。
+
+        valid_mask=None 时，全图参与伪标签损失，主要用于无标签样本。
+        valid_mask=(mask_l == ignore_index) 时，只在切片弱标注样本的未知区域计算。
+        """
+        with torch.no_grad():
+            target1, target2 = self._pseudo_targets(pred1, pred2)
+        loss1 = self.pseudo_loss_fn(pred1, target1, valid_mask=valid_mask)
+        loss2 = self.pseudo_loss_fn(pred2, target2, valid_mask=valid_mask)
+        return 0.5 * (loss1 + loss2)
+
+    def _make_reliable_pseudo_mask(self, pred1, pred2):
+        """
+        为无标签对比学习生成可靠伪标签 mask。
+
+        逻辑：
+          - 两个分支平均概率足够高，认为是可靠前景；
+          - 两个分支平均概率足够低，认为是可靠背景；
+          - 可选要求两个分支二值预测一致；
+          - 可选要求两个分支概率差不超过 max_branch_diff。
+
+        不可靠区域置为 ignore_index，后续不会被采样为 CL 小框。
+        """
+        prob1 = torch.sigmoid(pred1)
+        prob2 = torch.sigmoid(pred2)
+        avg_prob = 0.5 * (prob1 + prob2)
+        diff = torch.abs(prob1 - prob2)
+
+        pseudo = (avg_prob > 0.5).float()
+        reliable = (avg_prob >= self.min_fg_prob) | (avg_prob <= self.max_bg_prob)
+
+        if self.use_reliable_agreement:
+            reliable = reliable & ((prob1 > 0.5) == (prob2 > 0.5))
+
+        if self.max_branch_diff >= 0:
+            reliable = reliable & (diff <= self.max_branch_diff)
+
+        pseudo_mask = pseudo.clone()
+        pseudo_mask[~reliable] = self.ignore_index
+        return pseudo_mask
+
+    def _supervised_loss(self, pred1_l, pred2_l, mask_l, img_l):
+        """两个分支都在真实切片标注区域上计算监督损失，然后取平均。"""
+        if isinstance(self.sup_loss_fn, SparseSliceLoss):
+            loss1 = self.sup_loss_fn(pred1_l, mask_l, img_l)
+            loss2 = self.sup_loss_fn(pred2_l, mask_l, img_l)
+        else:
+            loss1 = self.sup_loss_fn(pred1_l, mask_l)
+            loss2 = self.sup_loss_fn(pred2_l, mask_l)
+        return 0.5 * (loss1 + loss2)
 
     def forward(self, preds_l, mask_l, preds_u, feats_l, feats_u, current_epoch, img_l=None):
+        """
+        总损失前向流程。
+
+        输入：
+          preds_l: labeled 图像的两个分支预测；
+          mask_l : labeled 图像的切片弱标注；
+          preds_u: unlabeled 图像的两个分支预测；
+          feats_l / feats_u: 两个分支对应的 decoder feature，用于 CL。
+        """
         pred1_l, pred2_l = preds_l
         pred1_u, pred2_u = preds_u
-        feat1_l, feat2_l = feats_l
-        feat1_u, feat2_u = feats_u
 
-        # ==========================================
-        # 1. 监督损失 (回归基础版逻辑)
-        # ==========================================
-        if isinstance(self.sup_loss_fn, SparseSliceLoss):
-            loss_sup = 0.5 * (
-                    self.sup_loss_fn(pred1_l, mask_l, img_l)
-                    + self.sup_loss_fn(pred2_l, mask_l, img_l)
-            )
+        # 1. 真实监督损失：只在真实标注切片区域计算。
+        loss_sup = self._supervised_loss(pred1_l, pred2_l, mask_l, img_l)
+
+        # 2. CPS 伪标签损失：无标签样本全图参与。
+        loss_ps_u = self._pseudo_loss_pair(pred1_u, pred2_u, valid_mask=None)
+
+        # 3. CPS 伪标签损失：切片弱标注样本只在未知区域参与。
+        labeled_unknown_mask = (mask_l == getattr(self.sup_loss_fn, "ignore_index", self.ignore_index)).float()
+        if labeled_unknown_mask.sum() > 0:
+            loss_ps_l = self._pseudo_loss_pair(pred1_l, pred2_l, valid_mask=labeled_unknown_mask)
+            loss_ps = 0.5 * (loss_ps_u + loss_ps_l)
         else:
-            loss_sup = 0.5 * (
-                    self.sup_loss_fn(pred1_l, mask_l)
-                    + self.sup_loss_fn(pred2_l, mask_l)
-            )
+            loss_ps = loss_ps_u
 
-        # ==========================================
-        # 2. 交叉伪标签损失 (完全退回原始逻辑：简单截断，不带Mask屏蔽)
-        # ==========================================
-        with torch.no_grad():
-            loss_target_1, loss_target_2 = self._pseudo_loss_targets(pred1_u, pred2_u)
-            _, reliable_pseudo = self._make_pseudo_and_reliable_masks(pred1_u, pred2_u)
-
-        # 直接传入 pseudo_loss_fn 互相监督 (不带 mask)
-        loss_ps_1 = self.pseudo_loss_fn(pred1_u, loss_target_1)
-        loss_ps_2 = self.pseudo_loss_fn(pred2_u, loss_target_2)
-
+        # 4. 根据 ramp-up / 冷启动设置调整伪标签损失权重。
         rampup_weight = self.sigmoid_rampup(current_epoch, self.ramp_epochs)
-        loss_ps = 0.5 * (loss_ps_1 + loss_ps_2) * (self.max_pseudo_weight * rampup_weight)
-        # ==========================================
-        # 2. 混合 Soft 伪标签损失
-        # ==========================================
-        # with torch.no_grad():
-        #     prob1 = torch.sigmoid(pred1_u)
-        #     prob2 = torch.sigmoid(pred2_u)
-        #
-        #     # 每个样本随机一个 alpha，自动广播到 [B, 1, D, H, W]
-        #     alpha = torch.rand(
-        #         size=(prob1.shape[0], 1, 1, 1, 1),
-        #         device=prob1.device,
-        #         dtype=prob1.dtype
-        #     )
-        #
-        #     # 不截断，保留 soft pseudo label
-        #     pseudo_mix = alpha * prob1 + (1.0 - alpha) * prob2
-        #
-        #     # 注意：下面这两个 hard pseudo mask 只给无标签对比学习的采样 mask 使用。
-        #     # 伪标签损失 loss_ps 不再使用 hard pseudo_1 / pseudo_2。
-        #     pseudo_1 = (prob1 > 0.5).float()
-        #     pseudo_2 = (prob2 > 0.5).float()
-        #
-        # # 两个分支共同学习混合后的 soft pseudo label
-        # loss_ps_1 = self.pseudo_loss_fn(pred1_u, pseudo_mix)
-        # loss_ps_2 = self.pseudo_loss_fn(pred2_u, pseudo_mix)
-        #
-        # rampup_weight = self.sigmoid_rampup(current_epoch, self.ramp_epochs)
-        # loss_ps = 0.5 * (loss_ps_1 + loss_ps_2) * (self.max_pseudo_weight * rampup_weight)
-        # ==========================================
-        # 3. 动态对比学习损失 (你的独家 Contribution)
-        # ==========================================
+        weighted_loss_ps = loss_ps * (self.max_pseudo_weight * rampup_weight)
+
+        # 5. 对比学习损失：先用 labeled 更新原型，warmup 后再加入无标签可靠伪标签区域。
         loss_cl = torch.tensor(0.0, device=pred1_l.device)
-        if self.enable_cl and feats_l is not None:
-            # 真实标签数据的对比学习
+        if self.enable_cl and feats_l is not None and feats_u is not None:
+            feat1_l, feat2_l = feats_l
+            feat1_u, feat2_u = feats_u
+
             loss_cl_l1 = self.cl_loss_fn(feat1_l, mask_l, is_gt=True, update_proto=True)
             loss_cl_l2 = self.cl_loss_fn(feat2_l, mask_l, is_gt=True, update_proto=True)
             loss_cl = 0.5 * (loss_cl_l1 + loss_cl_l2)
 
-            # 无标签数据的对比学习
             if current_epoch >= self.warmup:
-                # The unlabeled contrastive branch should only sample boxes from high-confidence
-                # pseudo regions. A small branch difference alone is insufficient because both
-                # decoders can agree around 0.5. Here the pseudo mask keeps only:
-                #   1) high-confidence foreground or background,
-                #   2) optional branch agreement,
-                #   3) optional max branch probability difference.
+                with torch.no_grad():
+                    reliable_pseudo = self._make_reliable_pseudo_mask(pred1_u, pred2_u)
                 loss_cl_u1 = self.cl_loss_fn(feat1_u, reliable_pseudo, is_gt=False, update_proto=False)
                 loss_cl_u2 = self.cl_loss_fn(feat2_u, reliable_pseudo, is_gt=False, update_proto=False)
                 loss_cl = loss_cl + 0.5 * (loss_cl_u1 + loss_cl_u2)
 
-        total_loss = loss_sup + loss_ps
+        total_loss = loss_sup + weighted_loss_ps
         if self.enable_cl:
             total_loss = total_loss + self.cl_weight * loss_cl
 

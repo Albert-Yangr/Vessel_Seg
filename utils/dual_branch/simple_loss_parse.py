@@ -66,8 +66,8 @@ class SparseSliceLoss(nn.Module):
             loss_dice = torch.tensor(0.0, device=pred_logits.device)
 
         probs = torch.sigmoid(pred_logits)
-        loss_aff = self.compute_affinity_loss(probs, images, sigma=1.0)
-        loss_tv = self.compute_tv_loss(probs)
+        loss_aff = self.compute_affinity_loss(probs, images, sigma=1.0) if self.affinity_weight > 0 else 0.0
+        loss_tv = self.compute_tv_loss(probs) if self.tv_weight > 0 else 0.0
 
         return (self.bce_weight * loss_bce) + \
             (self.dice_weight * loss_dice) + \
@@ -99,23 +99,49 @@ class SparseSliceLoss(nn.Module):
 
 # 🌟 必须加上这个，否则伪标签模块找不到它
 class SimplePseudoLoss(nn.Module):
+    """
+    Parse/肺部特别版使用的伪标签损失。
+
+    与基础 SimplePseudoLoss 保持一致，支持 valid_mask：
+      - valid_mask=None 时，全图参与伪标签损失；
+      - valid_mask 传入 mask_l == 255 时，只在切片弱标注样本的未知区域计算。
+
+    target 可以是 hard 0/1 伪标签，也可以是 soft probability map。
+    """
+
     def __init__(self, dice_weight=1.0, ce_weight=0.0):
         super().__init__()
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
-        self.bce_func = nn.BCEWithLogitsLoss()
+        self.bce_func = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, preds, target):
+    def forward(self, preds, target, valid_mask=None):
+        """
+        计算 masked Dice + masked BCE。
+
+        这里使用 reduction="none" 的 BCE，然后手动乘 valid_mask，确保真实标注区域
+        不会被伪标签损失覆盖。
+        """
         target = target.float()
+        if valid_mask is None:
+            valid_mask = torch.ones_like(target, dtype=target.dtype, device=target.device)
+        else:
+            valid_mask = valid_mask.float().to(device=target.device, dtype=target.dtype)
+
+        valid_count = valid_mask.sum()
+        if valid_count <= 0:
+            return preds.sum() * 0.0
+
         loss_dice = 0.0
         if self.dice_weight > 0:
             pred_prob = torch.sigmoid(preds)
-            intersection = (pred_prob * target).sum()
-            denominator = pred_prob.sum() + target.sum()
+            intersection = (pred_prob * target * valid_mask).sum()
+            denominator = (pred_prob * valid_mask).sum() + (target * valid_mask).sum()
             loss_dice = 1.0 - (2.0 * intersection + 1e-5) / (denominator + 1e-5)
 
         loss_ce = 0.0
         if self.ce_weight > 0:
-            loss_ce = self.bce_func(preds, target)
+            ce_pixel = self.bce_func(preds, target)
+            loss_ce = (ce_pixel * valid_mask).sum() / (valid_count + 1e-6)
 
         return self.dice_weight * loss_dice + self.ce_weight * loss_ce

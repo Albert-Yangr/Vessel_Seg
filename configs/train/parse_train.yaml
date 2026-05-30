@@ -23,6 +23,8 @@ input_size: [128, 128, 128]
 val_frequency: 2000
 batch_size: 2
 repeats: 10
+min_valid_label_pixels: 1
+max_labeled_crop_retries: 20
 ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
 pseudo_weight: 0.5
 pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签

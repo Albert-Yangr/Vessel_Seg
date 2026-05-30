@@ -1,4 +1,22 @@
 # @package _global_
+
+# =============================================================================
+# 动态小框对比学习训练配置
+# -----------------------------------------------------------------------------
+# 对应入口脚本：
+#   train/dyn_box_train.py
+#
+# 对应核心模块：
+#   utils/dual_cl/model.py         双分支 DynUNet，并返回 decoder feature
+#   utils/dual_cl/module.py        Lightning training loop 封装
+#   utils/dual_cl/loss_dyn_box.py  CPS + 连通域自适应 ROI 对比学习总损失
+#
+# 当前实验含义：
+#   在基础 Dual-CPS 半监督框架上，加入“连通域形态感知自适应小框对比学习”。
+#   对每个血管锚点，不再裁固定正方形，而是找到该锚点所在 2D 连通域，
+#   用包围盒框住完整连通域，再重采样到固定 roi_size 做对比学习。
+# =============================================================================
+
 defaults:
   - /trainer: default
   - /hydra: default
@@ -6,33 +24,67 @@ defaults:
   - /data: CAS2023
   - _self_
 
+# -----------------------------------------------------------------------------
+# 实验命名与随机性
+# -----------------------------------------------------------------------------
 data_name: CAS2023
 loss_name: 动态小框-新对比-温度
 seed: 43
 
+# -----------------------------------------------------------------------------
+# 输出与断点
+# -----------------------------------------------------------------------------
+# checkpoint 会保存到：
+#   ${chkpt_folder}/${data_name}/${loss_name}
+# 同时 train/dyn_box_train.py 会把完整 Hydra 配置保存为 train_config.yaml，
+# 并在 experiment_record_root 下生成实验记录，方便后续回看。
 chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
 experiment_record_root: /home/yangrui/Project/Base-model/local_results/experiments
-path_to_chkpt: null
-resume_ckpt_path: null
+path_to_chkpt: null          # 可选：加载基础 nnUNet/DynUNet 预训练权重
+resume_ckpt_path: null       # 可选：从 Lightning checkpoint 断点恢复
 
-label_suffix: ".slice.nii.gz"
+# -----------------------------------------------------------------------------
+# 数据与训练长度
+# -----------------------------------------------------------------------------
+label_suffix: ".slice.nii.gz"     # 切片弱监督标签，未标注区域通常为 255
 input_size: [128, 128, 128]
-val_frequency: 500
+val_frequency: 500                # Lightning val_check_interval，按 step 触发验证
 batch_size: 2
-repeats: 10
-ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
+repeats: 10                       # labeled/unlabeled dataset 的虚拟重复倍数
+
+# labeled 随机裁剪保护：
+#   切片弱标注很稀疏，普通随机裁剪可能完全裁不到标注切片。
+#   min_valid_label_pixels > 0 时，会要求 labeled crop 至少包含这些非 255 标注像素。
+min_valid_label_pixels: 1
+max_labeled_crop_retries: 20
+
+# -----------------------------------------------------------------------------
+# CPS 伪标签损失控制
+# -----------------------------------------------------------------------------
+# ramp_epochs:
+#   >0 表示伪标签损失从较小权重逐步 ramp-up 到 pseudo_weight；
+#   =0 表示关闭 ramp-up，训练一开始就直接使用 pseudo_weight。
+ramp_epochs: 100
 pseudo_weight: 0.5
-pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签
+
+# pseudo_label_mode:
+#   hard: 分支 1 学分支 2 的 0/1 硬伪标签，分支 2 学分支 1 的 0/1 硬伪标签。
+#   soft: 两个分支的概率图随机混合成 soft pseudo label，两个分支共同学习。
+pseudo_label_mode: hard
 
 optimizer:
   lr: 1e-4
   weight_decay: 1e-5
 
 loss_configs:
+  # 完整标签监督损失。当前 label_suffix 包含 ".slice"，因此实际不会走这里。
   label_loss:
     _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
     dice_weight: 0.9
     bce_weight: 0.1
+
+  # 切片弱监督损失。
+  # 只在 mask != ignore_index 的真实标注区域计算 Dice + BCE。
   slice_loss:
     _target_: utils.dual_branch.simple_loss.SparseSliceLoss
     dice_weight: 0.9
@@ -40,61 +92,117 @@ loss_configs:
     affinity_weight: 0
     tv_weight: 0
     ignore_index: 255
+
+  # CPS 伪标签损失。
+  # loss_dyn_box.py 会在两个区域调用它：
+  #   1. 无标签样本全图；
+  #   2. 有切片弱标注样本的 mask == 255 未知区域。
   pseudo_loss:
     _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
     dice_weight: 0.9
     ce_weight: 0.1
 
-  # =======================================================================
-  # 🚀 独家创新：连通域形态感知对比学习 (Component-Adaptive CL)
-  # =======================================================================
+  # ---------------------------------------------------------------------------
+  # 连通域形态感知自适应 ROI 对比学习
+  # ---------------------------------------------------------------------------
   contrastive:
-    enable: true              # 总开关：是否启用对比学习
-    weight: 0.2               # 对比学习 Loss 在整体 Loss 中的缩放权重
-    warmup_epochs: 20         # 绝对静默期：前 20 轮禁止无标签伪标签参与，仅用真实 GT 慢速建立原型
-    temperature: 0.5          # InfoNCE 温度系数：越小(如0.1)对负样本难例的排斥越极端
-    feat_dim: 32              # 特征投影头 (Projection Head) 映射后的统一通道维度
+    # 总开关。false 时只训练 Dual-CPS，不计算 CL。
+    enable: true
 
-    # --- 动态温度控制 ---
+    # 对比学习损失在总损失中的权重：
+    #   total_loss = loss_sup + pseudo_weight * loss_ps + weight * loss_cl
+    weight: 0.2
+
+    # CL warmup：
+    #   前 warmup_epochs 轮只用有标签样本做 CL，并更新 EMA 原型；
+    #   达到 warmup 后，才加入无标签可靠伪标签区域的 CL。
+    warmup_epochs: 10
+
+    # 固定温度。dynamic_temperature.enable=false 时使用该值。
+    temperature: 0.5
+
+    # decoder feature 的通道维度，需要和 model.py 返回的 feature 通道一致。
+    feat_dim: 32
+
+    # 动态温度控制：
+    #   根据正样本相似度和难负样本相似度的差距调节温度。
+    #   差距大，样本可靠，使用低温度强化区分；
+    #   差距小，样本不确定，使用高温度降低梯度冲击。
     dynamic_temperature:
-      enable: true            # 开启后，根据正负相似度差距动态调节 InfoNCE 温度；关闭则使用上面的固定 temperature
-      min_temperature: 0.1    # 高置信样本使用低温度，增强正负区分
-      max_temperature: 0.5    # 低置信样本使用高温度，降低不可靠样本梯度冲击
+      enable: true
+      min_temperature: 0.1
+      max_temperature: 0.5
 
+    # -------------------------------------------------------------------------
+    # 锚点采样与 ROI 重采样
+    # -------------------------------------------------------------------------
+    # 每个样本最多采样多少个血管锚点和背景锚点。
+    # 实际小框数可能更少，因为没有足够前景/背景时会跳过。
+    num_patches: 12
 
-    # 🫁 肺部专有参数：动态 2D 面积剥离阈值
-    # area_threshold: 400
+    # 自适应 ROI 最终统一重采样到 roi_size x roi_size。
+    # 注意：自适应发生在重采样前，原始 bbox 可以很长、很大、非正方形。
+    roi_size: 16
 
+    # fallback 固定小框尺寸：
+    # 当连通域太小、太大、bbox 异常、重采样后前景太少时，退回固定小框。
+    base_patch_size: 16
 
-    # --- 锚点采样与尺度形变 ---
-    num_patches: 12           # 每张图最大采样的血管锚点数/背景锚点数
-    roi_size: 16              # 🌟 核心：强制形变映射的 Target 尺寸！(所有血管框都会被强行拉伸/挤压为 16x16)
-    base_patch_size: 16       # 降级方案：对于背景锚点或提取失败的区域，默认切 16x16 的正方形
+    # -------------------------------------------------------------------------
+    # 连通域搜索与 flood-fill
+    # -------------------------------------------------------------------------
+    # search_size=0 表示在整张 2D 切片内搜索锚点所在连通域；
+    # >0 表示只在锚点附近 search_size x search_size 局部窗口内搜索。
+    search_size: 0
 
-    # --- 张量级洪泛提取 (Flood-Fill) 参数 ---
-    search_size: 0            # 局部搜索视野：0 表示在整张切片全图范围内搜索连通域 (视野最大化)
-    max_flood_iters: 256      # 张量膨胀最大迭代次数：控制连通域生长的极限距离
-    min_component_pixels: 2   # 防噪点：连通域像素数如果 < 2，说明是孤立噪点，退回固定裁剪
-    max_component_pixels: 100000 # 防核爆：连通域像素过大时退回固定裁剪，防止占满显存
+    # flood-fill 最大迭代次数。过小可能截断长条血管，过大增加耗时。
+    max_flood_iters: 256
 
-    # --- 实例包围盒 (Instance BBox) 与 难例挖掘 ---
-    margin_ratio: 0.25        # 🌟 核心：自适应缓冲带！包围盒向外扩展长宽的 25% 来获取“灰雾背景难例”
-    min_margin: 3             # 最小外扩像素数：保证哪怕是很细的毛细血管，外面也有至少 3 像素背景供排斥
-    max_margin: 16            # 最大外扩像素数：防止粗大动脉瘤扩出边界太远
-    max_bbox_area_ratio: 1.0  # 包围盒占全图的最大比例，超过则判定为异常
-    min_resized_fg_pixels: 2  # 验证参数：形变后，如果有效前景像素 < 2 则视为形变失败
-    near_bg_kernel: 9         # 🌟 核心：近邻难例挖掘核！通过 max_pool 膨胀 9 圈来锁定紧贴血管外壁的最难分辨背景
+    # 连通域像素数下限。小于该值认为可能是噪点，退回固定小框。
+    min_component_pixels: 2
 
-    # --- EMA 动量原型 ---
-    proto_momentum: 0.95      # 动量更新系数：0.95 意味着原型 95% 继承历史真理，5% 吸收当前 Batch (提供极高的稳定性)
-    ignore_index: 255         # 🌟 核心：相邻目标屏蔽！如果在包围盒内框到了其他未连通的邻居血管，强行设为 255 无视其干扰
+    # 连通域像素数上限。大于该值认为过大或异常，退回固定小框。
+    max_component_pixels: 100000
 
-    # --- 伪标签置信度控制：仅用于无标签对比学习小框采样 ---
-    # avg_prob >= min_fg_prob 作为可靠前景；avg_prob <= max_bg_prob 作为可靠背景。
-    # 不可靠区域会被置为 255，不参与无标签动态小框采样。
+    # -------------------------------------------------------------------------
+    # 包围盒扩张与异常保护
+    # -------------------------------------------------------------------------
+    # bbox 外扩比例。比如 0.25 表示按连通域较长边的 25% 向外扩一圈上下文。
+    margin_ratio: 0.25
+
+    # 最小/最大外扩像素数，避免细血管没有背景上下文，也避免粗大区域扩得过远。
+    min_margin: 3
+    max_margin: 16
+
+    # bbox 占整张 2D 特征图面积的最大比例。
+    # 1.0 表示允许覆盖整张切片；如果想更保守可以降到 0.5 或 0.75。
+    max_bbox_area_ratio: 1.0
+
+    # ROI 重采样后，前景像素少于该值则认为小框无效，退回固定小框。
+    min_resized_fg_pixels: 2
+
+    # 微观对比中的近邻背景核。
+    # 会对血管 mask 做 max_pool 膨胀，只选紧贴血管外壁的背景作为难负样本。
+    near_bg_kernel: 9
+
+    # EMA 原型更新动量。
+    # 越接近 1，原型越稳定；越小，当前 batch 对原型影响越大。
+    proto_momentum: 0.95
+
+    # 忽略标签。CL 小框中不可靠区域、其他未连接血管片段会置为该值。
+    ignore_index: 255
+
+    # -------------------------------------------------------------------------
+    # 无标签 CL 可靠伪标签筛选
+    # -------------------------------------------------------------------------
+    # 这些参数只影响“无标签对比学习的小框采样”，不直接影响 CPS 伪标签损失。
+    #
+    # avg_prob >= min_fg_prob 认为是可靠前景；
+    # avg_prob <= max_bg_prob 认为是可靠背景；
+    # 其他区域置为 ignore_index，不参与无标签 CL 采样。
     pseudo_confidence: 0.75
-    use_reliable_agreement: true
-    max_branch_diff: 0.2
+    use_reliable_agreement: true   # 是否要求两个分支 hard 预测一致
+    max_branch_diff: 0.2           # 两分支概率差超过该值则认为不可靠；设为 -1 可关闭
     min_fg_prob: 0.75
     max_bg_prob: 0.25
 

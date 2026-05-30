@@ -10,6 +10,15 @@ from utils.dual_branch.simple_loss_parse import SparseSliceLoss
 # 🫁 肺部专版：基于 2D 面积的形态感知对比学习 (Pulmonary Area-Adaptive CL)
 # =========================================================================
 class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
+    """
+    肺部血管面积感知对比学习。
+
+    肺部血管在切片上常出现中心大团块/主干区域。如果直接把这些区域作为普通
+    血管小框参与对比学习，原型容易被大块主干主导。该版本会先在 2D 切片上
+    根据连通域面积将过大的前景区域标记为 2，再重点使用细小分支 1 和背景 0
+    进行对比学习。
+    """
+
     def __init__(self, cfg):
         super().__init__()
         self.feat_dim = int(cfg.get("feat_dim", 32))
@@ -44,6 +53,7 @@ class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
         self.register_buffer("bg_proto", F.normalize(torch.randn(self.feat_dim), dim=0))
 
     def _dynamic_temp_from_margin(self, pos_sim, neg_sim):
+        """根据正负相似度差距动态调节 InfoNCE 温度。"""
         if not self.dynamic_temperature:
             return torch.full_like(pos_sim, self.temperature)
 
@@ -61,6 +71,7 @@ class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
             return mask
         return F.interpolate(mask.float(), size=feat.shape[2:], mode="nearest")
 
+    # 对单张 2D 切片做面积分离：小连通域保持为 1，大于阈值的主干/团块置为 2。
     def _dynamic_trunk_separation_2d(self, mask2d_tensor):
         """
         [极速核心] 仅对选定的单张 2D 切片进行面积连通域判定，耗时 < 0.5ms。
@@ -119,6 +130,7 @@ class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
             if torch.equal(comp, prev): break
         return comp & (fg4[0, 0] > 0)
 
+    # 根据锚点所属连通域构造自适应 ROI，并屏蔽同框内其他血管/主干区域。
     def _component_crop(self, feat2d, mask2d, ay, ax):
         _, H, W = feat2d.shape
         y0, y1, x0, x1 = 0, H, 0, W
@@ -295,6 +307,12 @@ class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
         return b_mask_flat.bool() & near
 
     def compute_macro_micro_loss(self, v_feats_list, v_masks_list, b_feats_list, b_masks_list):
+        """
+        计算宏观原型对比和框内微观对比。
+
+        该肺部版只把 1 作为血管正类，把 0 作为背景负类；
+        标签 2 的大面积主干区域不参与当前对比损失。
+        """
         macro_loss = torch.tensor(0.0, device=self.vessel_proto.device)
         micro_loss = torch.tensor(0.0, device=self.vessel_proto.device)
         valid_macro, valid_micro = 0, 0
@@ -354,6 +372,21 @@ class PulmonaryAreaAdaptivePatchContrastiveLoss(nn.Module):
 
 
 class DualBranchLoss(nn.Module):
+    """
+    肺部/Parse 特别版对比学习总损失。
+
+    这个版本的 CL 核心和动态自适应小框版类似，但额外包含肺部血管场景的
+    面积剥离逻辑：在无标签伪标签切片中，大面积主干区域可以被标记为 2，
+    后续小框采样时只重点使用细小分支 1 和背景 0。
+
+    总损失由三部分组成：
+      1. 切片弱监督真实标签损失；
+      2. 双分支 CPS 伪标签损失；
+      3. 肺部面积感知的小框对比学习损失。
+
+    软/硬伪标签、ramp-up、动态温度、无标签 CL 可靠区域筛选都由 yaml 配置控制。
+    """
+
     def __init__(self, base_sup_loss, pseudo_loss_fn, cl_cfg=None, ramp_epochs=50, max_pseudo_weight=0.5,
                  pseudo_label_mode="hard"):
         super().__init__()
@@ -362,19 +395,25 @@ class DualBranchLoss(nn.Module):
         self.ramp_epochs = ramp_epochs
         self.max_pseudo_weight = max_pseudo_weight
         self.pseudo_label_mode = str(pseudo_label_mode).lower()
-        self.cl_cfg = cl_cfg
-        self.enable_cl = cl_cfg.get("enable", False) if cl_cfg else False
-        cfg_for_pseudo = cl_cfg or {}
-        self.pseudo_confidence = float(cfg_for_pseudo.get("pseudo_confidence", 0.75))
-        self.use_reliable_agreement = bool(cfg_for_pseudo.get("use_reliable_agreement", True))
-        self.max_branch_diff = float(cfg_for_pseudo.get("max_branch_diff", 0.2))
-        self.min_fg_prob = float(cfg_for_pseudo.get("min_fg_prob", self.pseudo_confidence))
-        self.max_bg_prob = float(cfg_for_pseudo.get("max_bg_prob", 1.0 - self.pseudo_confidence))
+
+        self.cl_cfg = cl_cfg or {}
+        self.enable_cl = bool(self.cl_cfg.get("enable", False))
+        self.ignore_index = int(self.cl_cfg.get("ignore_index", getattr(base_sup_loss, "ignore_index", 255)))
+
+        self.pseudo_confidence = float(self.cl_cfg.get("pseudo_confidence", 0.75))
+        self.use_reliable_agreement = bool(self.cl_cfg.get("use_reliable_agreement", True))
+        self.max_branch_diff = float(self.cl_cfg.get("max_branch_diff", 0.2))
+        self.min_fg_prob = float(self.cl_cfg.get("min_fg_prob", self.pseudo_confidence))
+        self.max_bg_prob = float(self.cl_cfg.get("max_bg_prob", 1.0 - self.pseudo_confidence))
 
         if self.enable_cl:
-            self.cl_loss_fn = PulmonaryAreaAdaptivePatchContrastiveLoss(cl_cfg)
-            self.cl_weight = float(cl_cfg.get("weight", 0.2))
-            self.warmup = int(cl_cfg.get("warmup_epochs", 20))
+            self.cl_loss_fn = PulmonaryAreaAdaptivePatchContrastiveLoss(self.cl_cfg)
+            self.cl_weight = float(self.cl_cfg.get("weight", 0.2))
+            self.warmup = int(self.cl_cfg.get("warmup_epochs", 20))
+        else:
+            self.cl_loss_fn = None
+            self.cl_weight = 0.0
+            self.warmup = 0
 
     def sigmoid_rampup(self, current, rampup_length):
         if rampup_length <= 0:
@@ -383,33 +422,10 @@ class DualBranchLoss(nn.Module):
         phase = 1.0 - current / rampup_length
         return float(np.exp(-5.0 * phase * phase))
 
-    def _make_pseudo_and_reliable_masks(self, pred1_u, pred2_u):
-        prob1 = torch.sigmoid(pred1_u)
-        prob2 = torch.sigmoid(pred2_u)
-        avg_prob = 0.5 * (prob1 + prob2)
-        diff = torch.abs(prob1 - prob2)
-
-        pseudo = (avg_prob > 0.5).float()
-        fg_reliable = avg_prob >= self.min_fg_prob
-        bg_reliable = avg_prob <= self.max_bg_prob
-        reliable = fg_reliable | bg_reliable
-
-        if self.use_reliable_agreement:
-            agreement = (prob1 > 0.5) == (prob2 > 0.5)
-            reliable = reliable & agreement
-
-        if self.max_branch_diff is not None and self.max_branch_diff >= 0:
-            reliable = reliable & (diff <= self.max_branch_diff)
-
-        pseudo_mask = pseudo.clone()
-        pseudo_mask[~reliable] = 255
-        return pseudo, pseudo_mask
-
-    def _pseudo_loss_targets(self, pred1_u, pred2_u):
-        prob1 = torch.sigmoid(pred1_u)
-        prob2 = torch.sigmoid(pred2_u)
-        pseudo_1 = (prob1 > 0.5).float()
-        pseudo_2 = (prob2 > 0.5).float()
+    def _pseudo_targets(self, pred1, pred2):
+        """根据 pseudo_label_mode 生成 hard 或 soft CPS 伪标签。"""
+        prob1 = torch.sigmoid(pred1)
+        prob2 = torch.sigmoid(pred2)
 
         if self.pseudo_label_mode == "soft":
             alpha = torch.rand(
@@ -418,68 +434,107 @@ class DualBranchLoss(nn.Module):
                 dtype=prob1.dtype,
             )
             pseudo_mix = alpha * prob1 + (1.0 - alpha) * prob2
-            loss_target_1 = pseudo_mix
-            loss_target_2 = pseudo_mix
-        else:
-            loss_target_1 = pseudo_2
-            loss_target_2 = pseudo_1
+            return pseudo_mix, pseudo_mix
 
-        return loss_target_1, loss_target_2
+        return (prob2 > 0.5).float(), (prob1 > 0.5).float()
+
+    def _pseudo_loss_pair(self, pred1, pred2, valid_mask=None):
+        """
+        计算两个分支之间的 CPS 伪标签损失。
+
+        无标签样本使用 valid_mask=None，全图参与。
+        切片弱标注样本使用 mask_l == ignore_index，只让未知区域参与。
+        """
+        with torch.no_grad():
+            target1, target2 = self._pseudo_targets(pred1, pred2)
+        loss1 = self.pseudo_loss_fn(pred1, target1, valid_mask=valid_mask)
+        loss2 = self.pseudo_loss_fn(pred2, target2, valid_mask=valid_mask)
+        return 0.5 * (loss1 + loss2)
+
+    def _make_reliable_pseudo_mask(self, pred1, pred2):
+        """
+        为无标签 CL 生成可靠伪标签 mask。
+
+        该 mask 只用于对比学习小框采样，不直接决定伪标签损失。
+        不可靠区域被置为 ignore_index，避免从不确定区域采样小框。
+        """
+        prob1 = torch.sigmoid(pred1)
+        prob2 = torch.sigmoid(pred2)
+        avg_prob = 0.5 * (prob1 + prob2)
+        diff = torch.abs(prob1 - prob2)
+
+        pseudo = (avg_prob > 0.5).float()
+        reliable = (avg_prob >= self.min_fg_prob) | (avg_prob <= self.max_bg_prob)
+
+        if self.use_reliable_agreement:
+            reliable = reliable & ((prob1 > 0.5) == (prob2 > 0.5))
+
+        if self.max_branch_diff >= 0:
+            reliable = reliable & (diff <= self.max_branch_diff)
+
+        pseudo_mask = pseudo.clone()
+        pseudo_mask[~reliable] = self.ignore_index
+        return pseudo_mask
+
+    def _supervised_loss(self, pred1_l, pred2_l, mask_l, img_l):
+        """两个分支分别计算监督损失并取平均。"""
+        if isinstance(self.sup_loss_fn, SparseSliceLoss):
+            loss1 = self.sup_loss_fn(pred1_l, mask_l, img_l)
+            loss2 = self.sup_loss_fn(pred2_l, mask_l, img_l)
+        else:
+            loss1 = self.sup_loss_fn(pred1_l, mask_l)
+            loss2 = self.sup_loss_fn(pred2_l, mask_l)
+        return 0.5 * (loss1 + loss2)
 
     def forward(self, preds_l, mask_l, preds_u, feats_l, feats_u, current_epoch, img_l=None):
+        """
+        总损失前向流程：
+          1. labeled 图像真实标注区域做监督；
+          2. unlabeled 图像全图做 CPS；
+          3. labeled 图像未知区域也做 CPS；
+          4. labeled 特征更新 CL 原型；
+          5. warmup 后用可靠无标签伪标签区域做 CL。
+        """
         pred1_l, pred2_l = preds_l
         pred1_u, pred2_u = preds_u
 
-        # 1. 监督损失
-        if isinstance(self.sup_loss_fn, SparseSliceLoss):
-            loss_sup = 0.5 * (self.sup_loss_fn(pred1_l, mask_l, img_l) + self.sup_loss_fn(pred2_l, mask_l, img_l))
+        # 1. 真实切片监督损失。
+        loss_sup = self._supervised_loss(pred1_l, pred2_l, mask_l, img_l)
+
+        # 2. 无标签样本全图 CPS。
+        loss_ps_u = self._pseudo_loss_pair(pred1_u, pred2_u, valid_mask=None)
+
+        # 3. 有切片弱标注样本的未知区域 CPS。
+        labeled_unknown_mask = (mask_l == getattr(self.sup_loss_fn, "ignore_index", self.ignore_index)).float()
+        if labeled_unknown_mask.sum() > 0:
+            loss_ps_l = self._pseudo_loss_pair(pred1_l, pred2_l, valid_mask=labeled_unknown_mask)
+            loss_ps = 0.5 * (loss_ps_u + loss_ps_l)
         else:
-            loss_sup = 0.5 * (self.sup_loss_fn(pred1_l, mask_l) + self.sup_loss_fn(pred2_l, mask_l))
+            loss_ps = loss_ps_u
 
-        # 2. 伪标签损失 (无视大块血管，因为计算伪标签时直接二值化)
-        with torch.no_grad():
-            loss_target_1, loss_target_2 = self._pseudo_loss_targets(pred1_u, pred2_u)
-            _, reliable_pseudo = self._make_pseudo_and_reliable_masks(pred1_u, pred2_u)
+        # 4. 伪标签损失权重，可由 ramp_epochs 控制是否 ramp-up。
+        rampup_weight = self.sigmoid_rampup(current_epoch, self.ramp_epochs)
+        weighted_loss_ps = loss_ps * (self.max_pseudo_weight * rampup_weight)
 
-        loss_ps = 0.5 * (self.pseudo_loss_fn(pred1_u, loss_target_1) + self.pseudo_loss_fn(pred2_u, loss_target_2))
-        loss_ps = loss_ps * (self.max_pseudo_weight * self.sigmoid_rampup(current_epoch, self.ramp_epochs))
-        # 2. 混合 Soft 伪标签损失
-        # #    loss_ps 使用 pseudo_mix，不再使用 0.5 阈值截断后的 hard pseudo label。
-        # #    pseudo_1 / pseudo_2 仍然保留，只用于后面的无标签对比学习采样 mask。
-        # with torch.no_grad():
-        #     prob1 = torch.sigmoid(pred1_u)
-        #     prob2 = torch.sigmoid(pred2_u)
-        #
-        #     # 每个样本随机一个 alpha，形状自动广播到 [B, 1, D, H, W]
-        #     alpha = torch.rand(
-        #         size=(prob1.shape[0], 1, 1, 1, 1),
-        #         device=prob1.device,
-        #         dtype=prob1.dtype
-        #     )
-        #
-        #     # 不截断，保留 soft pseudo label
-        #     pseudo_mix = alpha * prob1 + (1.0 - alpha) * prob2
-        #
-        #     # 这两个 hard mask 只给后面的 CL 使用，不参与 loss_ps
-        #     pseudo_1 = (prob1 > 0.5).float()
-        #     pseudo_2 = (prob2 > 0.5).float()
-        #
-        # loss_ps_1 = self.pseudo_loss_fn(pred1_u, pseudo_mix)
-        # loss_ps_2 = self.pseudo_loss_fn(pred2_u, pseudo_mix)
-        # loss_ps = 0.5 * (loss_ps_1 + loss_ps_2)
-        # loss_ps = loss_ps * (self.max_pseudo_weight * self.sigmoid_rampup(current_epoch, self.ramp_epochs))
-        #
-        # 3. 对比学习
+        # 5. 面积感知对比学习损失。
         loss_cl = torch.tensor(0.0, device=pred1_l.device)
-        if self.enable_cl and feats_l is not None:
-            loss_cl += 0.5 * (
-                        self.cl_loss_fn(feats_l[0], mask_l, True, True) + self.cl_loss_fn(feats_l[1], mask_l, True,
-                                                                                          True))
+        if self.enable_cl and feats_l is not None and feats_u is not None:
+            feat1_l, feat2_l = feats_l
+            feat1_u, feat2_u = feats_u
+
+            loss_cl_l1 = self.cl_loss_fn(feat1_l, mask_l, is_gt=True, update_proto=True)
+            loss_cl_l2 = self.cl_loss_fn(feat2_l, mask_l, is_gt=True, update_proto=True)
+            loss_cl = 0.5 * (loss_cl_l1 + loss_cl_l2)
 
             if current_epoch >= self.warmup:
-                loss_cl += 0.5 * (
-                            self.cl_loss_fn(feats_u[0], reliable_pseudo, False, False) + self.cl_loss_fn(feats_u[1], reliable_pseudo,
-                                                                                                  False, False))
+                with torch.no_grad():
+                    reliable_pseudo = self._make_reliable_pseudo_mask(pred1_u, pred2_u)
+                loss_cl_u1 = self.cl_loss_fn(feat1_u, reliable_pseudo, is_gt=False, update_proto=False)
+                loss_cl_u2 = self.cl_loss_fn(feat2_u, reliable_pseudo, is_gt=False, update_proto=False)
+                loss_cl = loss_cl + 0.5 * (loss_cl_u1 + loss_cl_u2)
 
-        total_loss = loss_sup + loss_ps + (self.cl_weight * loss_cl if self.enable_cl else 0.0)
+        total_loss = loss_sup + weighted_loss_ps
+        if self.enable_cl:
+            total_loss = total_loss + self.cl_weight * loss_cl
+
         return total_loss, loss_sup, loss_ps, loss_cl

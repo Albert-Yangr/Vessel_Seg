@@ -107,7 +107,14 @@ def main(cfg):
         val_configs[dataset_name].path = os.path.join(cfg.data[dataset_name].path)
 
     train_ds = DualStreamDataset(
-        MutilSupervisionDataset(labeled_configs, mode="train", repeats=cfg.repeats, label_suffix=cfg.label_suffix),
+        MutilSupervisionDataset(
+            labeled_configs,
+            mode="train",
+            repeats=cfg.repeats,
+            label_suffix=cfg.label_suffix,
+            min_valid_label_pixels=cfg.get("min_valid_label_pixels", 1),
+            max_crop_retries=cfg.get("max_labeled_crop_retries", 20),
+        ),
         UnlabeledWeakDataset(unlabeled_configs, mode="train", repeats=cfg.repeats),
     )
     train_loader = hydra.utils.instantiate(cfg.dataloader, dataset=train_ds, shuffle=True)
@@ -140,6 +147,9 @@ def main(cfg):
         logger.info(f"Label suffix: {cfg.label_suffix}")
         logger.info(f"Supervised loss: {dual_loss.sup_loss_fn.__class__.__name__}")
         logger.info(f"Pseudo loss: {dual_loss.pseudo_loss_fn.__class__.__name__}")
+        logger.info(f"Pseudo label mode: {cfg.get('pseudo_label_mode', 'hard')}")
+        logger.info(f"Ramp epochs: {cfg.ramp_epochs}")
+        logger.info(f"Pseudo weight: {cfg.pseudo_weight}")
         if cl_cfg and cl_cfg.get("enable", False):
             logger.info("Component-adaptive ROI CL: enabled")
             logger.info(f"CL weight: {cl_cfg.get('weight')}")

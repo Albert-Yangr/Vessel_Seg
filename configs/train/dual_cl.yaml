@@ -23,6 +23,8 @@ input_size: [128, 128, 128]
 val_frequency: 2000
 batch_size: 2
 repeats: 10
+min_valid_label_pixels: 1
+max_labeled_crop_retries: 20
 ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
 pseudo_weight: 0.5
 pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签
@@ -54,9 +56,23 @@ loss_configs:
     weight: 0.5
     warmup_epochs: 20       # 前20轮只更新原型，不计算无标签的CL
     temperature: 0.1        # InfoNCE 温度
+    dynamic_temperature:
+      enable: false         # true=根据正负相似度差距动态调节温度；false=使用固定 temperature
+      min_temperature: 0.1
+      max_temperature: 0.5
     feat_dim: 32            # 网络倒数第二层特征维度
     patch_size: 16          # 🌟 统一尺寸：GT和伪标签全部使用 2D 的 16x16 切片框进行对齐
     num_patches: 16         # 每张图采样的血管/背景锚点数
+    ignore_index: 255
+
+    # 无标签对比学习选框的可靠伪标签筛选。
+    # avg_prob >= min_fg_prob 作为可靠前景；avg_prob <= max_bg_prob 作为可靠背景。
+    # 不可靠区域置为 ignore_index，不参与无标签 CL 小框采样。
+    pseudo_confidence: 0.75
+    use_reliable_agreement: true
+    max_branch_diff: 0.2
+    min_fg_prob: 0.75
+    max_bg_prob: 0.25
 
 # === 训练器底层配置 ===
 trainer:

@@ -111,7 +111,14 @@ def main(cfg):
         val_configs[dataset_name].path = os.path.join(cfg.data[dataset_name].path)
 
     train_ds = DualStreamDataset(
-        MutilSupervisionDataset(labeled_configs, mode="train", repeats=cfg.repeats, label_suffix=cfg.label_suffix),
+        MutilSupervisionDataset(
+            labeled_configs,
+            mode="train",
+            repeats=cfg.repeats,
+            label_suffix=cfg.label_suffix,
+            min_valid_label_pixels=cfg.get("min_valid_label_pixels", 1),
+            max_crop_retries=cfg.get("max_labeled_crop_retries", 20),
+        ),
         UnlabeledWeakDataset(unlabeled_configs, mode="train", repeats=cfg.repeats),
     )
     train_loader = hydra.utils.instantiate(cfg.dataloader, dataset=train_ds, shuffle=True)
