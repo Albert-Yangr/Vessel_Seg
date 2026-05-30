@@ -1,0 +1,120 @@
+# @package _global_
+defaults:
+  - /trainer: default
+  - /hydra: default
+  - /model: dyn_unet_base
+  - /data: CAS2023
+  - _self_
+
+data_name: CAS2023
+loss_name: 动态小框-新对比-温度
+seed: 43
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+experiment_record_root: /home/yangrui/Project/Base-model/local_results/experiments
+path_to_chkpt: null
+resume_ckpt_path: null
+
+label_suffix: ".slice.nii.gz"
+input_size: [128, 128, 128]
+val_frequency: 500
+batch_size: 2
+repeats: 10
+ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
+pseudo_weight: 0.5
+pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+loss_configs:
+  label_loss:
+    _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+  slice_loss:
+    _target_: utils.dual_branch.simple_loss.SparseSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+    affinity_weight: 0
+    tv_weight: 0
+    ignore_index: 255
+  pseudo_loss:
+    _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+
+  # =======================================================================
+  # 🚀 独家创新：连通域形态感知对比学习 (Component-Adaptive CL)
+  # =======================================================================
+  contrastive:
+    enable: true              # 总开关：是否启用对比学习
+    weight: 0.2               # 对比学习 Loss 在整体 Loss 中的缩放权重
+    warmup_epochs: 20         # 绝对静默期：前 20 轮禁止无标签伪标签参与，仅用真实 GT 慢速建立原型
+    temperature: 0.5          # InfoNCE 温度系数：越小(如0.1)对负样本难例的排斥越极端
+    feat_dim: 32              # 特征投影头 (Projection Head) 映射后的统一通道维度
+
+    # --- 动态温度控制 ---
+    dynamic_temperature:
+      enable: true            # 开启后，根据正负相似度差距动态调节 InfoNCE 温度；关闭则使用上面的固定 temperature
+      min_temperature: 0.1    # 高置信样本使用低温度，增强正负区分
+      max_temperature: 0.5    # 低置信样本使用高温度，降低不可靠样本梯度冲击
+
+
+    # 🫁 肺部专有参数：动态 2D 面积剥离阈值
+    # area_threshold: 400
+
+
+    # --- 锚点采样与尺度形变 ---
+    num_patches: 12           # 每张图最大采样的血管锚点数/背景锚点数
+    roi_size: 16              # 🌟 核心：强制形变映射的 Target 尺寸！(所有血管框都会被强行拉伸/挤压为 16x16)
+    base_patch_size: 16       # 降级方案：对于背景锚点或提取失败的区域，默认切 16x16 的正方形
+
+    # --- 张量级洪泛提取 (Flood-Fill) 参数 ---
+    search_size: 0            # 局部搜索视野：0 表示在整张切片全图范围内搜索连通域 (视野最大化)
+    max_flood_iters: 256      # 张量膨胀最大迭代次数：控制连通域生长的极限距离
+    min_component_pixels: 2   # 防噪点：连通域像素数如果 < 2，说明是孤立噪点，退回固定裁剪
+    max_component_pixels: 100000 # 防核爆：连通域像素过大时退回固定裁剪，防止占满显存
+
+    # --- 实例包围盒 (Instance BBox) 与 难例挖掘 ---
+    margin_ratio: 0.25        # 🌟 核心：自适应缓冲带！包围盒向外扩展长宽的 25% 来获取“灰雾背景难例”
+    min_margin: 3             # 最小外扩像素数：保证哪怕是很细的毛细血管，外面也有至少 3 像素背景供排斥
+    max_margin: 16            # 最大外扩像素数：防止粗大动脉瘤扩出边界太远
+    max_bbox_area_ratio: 1.0  # 包围盒占全图的最大比例，超过则判定为异常
+    min_resized_fg_pixels: 2  # 验证参数：形变后，如果有效前景像素 < 2 则视为形变失败
+    near_bg_kernel: 9         # 🌟 核心：近邻难例挖掘核！通过 max_pool 膨胀 9 圈来锁定紧贴血管外壁的最难分辨背景
+
+    # --- EMA 动量原型 ---
+    proto_momentum: 0.95      # 动量更新系数：0.95 意味着原型 95% 继承历史真理，5% 吸收当前 Batch (提供极高的稳定性)
+    ignore_index: 255         # 🌟 核心：相邻目标屏蔽！如果在包围盒内框到了其他未连通的邻居血管，强行设为 255 无视其干扰
+
+    # --- 伪标签置信度控制：仅用于无标签对比学习小框采样 ---
+    # avg_prob >= min_fg_prob 作为可靠前景；avg_prob <= max_bg_prob 作为可靠背景。
+    # 不可靠区域会被置为 255，不参与无标签动态小框采样。
+    pseudo_confidence: 0.75
+    use_reliable_agreement: true
+    max_branch_diff: 0.2
+    min_fg_prob: 0.75
+    max_bg_prob: 0.25
+
+trainer:
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True
+    max_epochs: 150
+    max_time: "00:48:00:00"
+    max_steps: -1
+    accelerator: gpu
+    devices: [3]
+    precision: 16-mixed
+    check_val_every_n_epoch: null
+    num_sanity_val_steps: 0
+
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  num_workers: 8
+  batch_size: ${batch_size}
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 2

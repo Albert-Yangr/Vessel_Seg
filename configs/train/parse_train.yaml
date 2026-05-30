@@ -1,0 +1,109 @@
+# @package _global_
+defaults:
+  - /trainer: default
+  - /hydra: default
+  - /model: dyn_unet_base
+  - /data: Parse
+  - _self_
+
+data_name: Parse
+loss_name: 软损失+动态温度+新无标签对比学习
+seed: 43
+
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+experiment_record_root: /home/yangrui/Project/Base-model/local_results/experiments
+path_to_chkpt: null
+resume_ckpt_path: null
+
+
+# 🌟 核心：使用含有 0, 1, 2 分级的离线标签
+label_suffix: ".slice2.nii.gz"
+input_size: [128, 128, 128]
+val_frequency: 2000
+batch_size: 2
+repeats: 10
+ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
+pseudo_weight: 0.5
+pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+loss_configs:
+  label_loss:
+    _target_: utils.dual_branch.simple_loss_parse.SimpleSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+  slice_loss:
+    _target_: utils.dual_branch.simple_loss_parse.SparseSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+    affinity_weight: 0
+    tv_weight: 0
+    ignore_index: 255
+  pseudo_loss:
+    _target_: utils.dual_branch.simple_loss_parse.SimplePseudoLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+
+  contrastive:
+    enable: true
+    weight: 0.2
+    warmup_epochs: 20
+    temperature: 0.5
+    feat_dim: 32
+
+    # 动态温度控制：开启后根据正负相似度差距自动调节 InfoNCE 温度
+    dynamic_temperature:
+      enable: true
+      min_temperature: 0.1
+      max_temperature: 0.5
+
+    # 🫁 肺部专有参数：动态 2D 面积剥离阈值
+    area_threshold: 400
+
+    num_patches: 12
+    roi_size: 16
+    base_patch_size: 16
+    search_size: 0
+    margin_ratio: 0.25
+    min_margin: 3
+    max_margin: 16
+    min_component_pixels: 2
+    max_component_pixels: 100000
+    max_bbox_area_ratio: 1.0
+    min_resized_fg_pixels: 2
+    max_flood_iters: 256
+    near_bg_kernel: 9
+    proto_momentum: 0.95
+    ignore_index: 255
+
+    # 伪标签置信度控制：仅用于无标签对比学习的小框采样
+    pseudo_confidence: 0.75
+    use_reliable_agreement: true
+    max_branch_diff: 0.2
+    min_fg_prob: 0.75
+    max_bg_prob: 0.25
+
+trainer:
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True
+    max_epochs: 150
+    max_time: "00:48:00:00"
+    max_steps: -1
+    accelerator: gpu
+    devices: [4]
+    precision: 16-mixed
+    check_val_every_n_epoch: null
+    num_sanity_val_steps: 0
+
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  num_workers: 8
+  batch_size: ${batch_size}
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 2

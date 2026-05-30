@@ -1,0 +1,152 @@
+# =============================================================================
+# 数据集基础配置部分
+# =============================================================================
+
+# 数据采样比例：控制训练时使用的数据量比例
+sample_prop: 1.0        # 1.0表示使用100%数据，0.5表示使用50%数据，用于快速实验
+
+# 文件格式：指定数据文件的存储格式
+file_format: "nii.gz"      # 使用NumPy二进制格式存储3D医学图像数据，支持高效读写
+
+# 图像尺寸：动态参数，从外部配置引入
+image_size: ${input_size}  # 引用hydra配置中的input_size变量，确保网络输入尺寸统一
+
+# 数据过滤：根据ID筛选特定样本
+filter_dataset_IDs: null  # null表示不使用过滤，使用全部数据；可设置为ID列表进行样本筛选
+
+
+transforms:
+
+  train:
+    # 1. 通道维度处理：确保数据格式符合PyTorch要求
+    - EnsureChannelFirstd:
+        keys: ["Image", "Mask"]      # 同时处理图像和对应的掩码
+        channel_dim: "no_channel"   # 自动添加通道维度[C,H,W,D]
+
+#    # 2. 中心裁剪：统一输入尺寸
+#    - CenterSpatialCropd:
+#        keys: [ "Image", "Mask" ]
+#        roi_size: ${input_size}     # 从中心裁剪到指定尺寸
+#        # 开启中心裁剪随机裁剪
+#        random_center: true         # 开启随机中心
+#        random_size: false          # 固定尺寸裁剪
+
+      # 2. 改为随机空间裁剪
+    - RandSpatialCropd: # <--- 修改为这个类名
+        keys: [ "Image", "Mask" ]
+        roi_size: ${input_size}
+        random_center: true
+        random_size: false
+
+    # 3. 强度归一化：标准化像素值范围
+    - ScaleIntensityd:
+        keys: ["Image"]
+        minv: 0
+        maxv: 1
+
+    # 4. 随机缩放：模拟不同拍摄距离
+    - RandZoomd:
+        keys: ["Image", "Mask"]
+        prob: 0.3                   # 30%概率应用缩放增强
+        min_zoom: 1                 # 最小缩放比例（不缩小）
+        max_zoom: 1.3               # 最大缩放比例（放大30%）
+        mode: ["bilinear", "nearest"] # 图像用双线性插值，掩码用最近邻
+        padding_mode: "zeros"       # 缩放后空白区域用零填充
+
+    # 5. 空间填充：确保尺寸一致性
+    - SpatialPadd:
+        keys: ["Image", "Mask"]
+        spatial_size: ${input_size} # 填充到目标尺寸
+        mode: "reflect"             # 反射填充模式，避免边缘伪影
+        method: "symmetric"        # 对称填充方法
+
+    # 6. 随机仿射变换：增加几何多样性
+    - RandAffined:
+        keys: ["Image", "Mask"]
+        prob: 0.3                   # 30%应用概率
+        shear_range: [0.4, 0.4, 0.4] # XYZ三个方向的剪切变换范围（弧度）
+        mode: ["bilinear", "nearest"] # 不同的插值策略
+        padding_mode: "zeros"       # 变换后空白区域填充
+
+    # 7. 随机翻转：增强旋转不变性
+    - RandFlipd:
+        keys: ["Image", "Mask"]
+        prob: 0.3                   # 30%概率沿X轴翻转
+        spatial_axis: 0             # 翻转轴：0=X轴，1=Y轴，2=Z轴
+
+    - RandFlipd:
+        keys: ["Image", "Mask"]
+        prob: 0.3                   # 30%概率沿Y轴翻转
+        spatial_axis: 1
+
+    # 8. 高斯平滑：模拟不同图像分辨率
+    - RandGaussianSmoothd:
+        keys: ["Image"]             # 只对图像添加模糊，掩码保持清晰
+        prob: 0.2                   # 20%应用概率
+        sigma_x: [0.0, 0.5]         # X方向高斯核标准差范围
+        sigma_y: [0.0, 0.5]         # Y方向标准差范围
+        sigma_z: [0.0, 0.5]         # Z方向标准差范围
+
+    # 9. 高斯噪声：增加噪声鲁棒性
+    - RandGaussianNoised:
+        keys: ["Image"]             # 只对图像添加噪声
+        prob: 0.2                   # 20%应用概率
+        std: 0.01                   # 噪声标准差
+        mean: 0.3                   # 噪声均值，模拟系统噪声
+
+    # 10. 直方图偏移：增强对比度不变性
+    - RandHistogramShiftd:
+        keys: ["Image"]             # 调整图像对比度
+        prob: 0.3                   # 30%应用概率
+        num_control_points: [5, 10] # 直方图控制点数量范围
+
+    # 11. 最终裁剪：确保精确尺寸
+    - CenterSpatialCropd:
+        keys: ["Image", "Mask"]
+        roi_size: ${input_size}     # 最终统一到目标尺寸
+
+    # 12. 张量转换：准备模型输入
+    - ToTensord:
+        keys: ["Image", "Mask"]     # 将NumPy数组转换为PyTorch张量
+
+  # ================================
+  # 验证集预处理流水线（简化版）
+  # ================================
+  val:
+    # 通道处理
+    - EnsureChannelFirstd:
+        keys: ["Image", "Mask"]
+        channel_dim: "no_channel"
+
+    # 百分位强度归一化：排除异常值影响
+    - ScaleIntensityRangePercentilesd:
+        keys: ["Image"]
+        lower: 2                     # 排除极端低值
+        upper: 98                    # 排除极端高值
+        b_min: 0                     # 映射到0
+        b_max: 1                     # 映射到1
+
+    # 张量转换
+    - ToTensord:
+        keys: [Image, Mask]
+
+  # ================================
+  # 测试集预处理流水线（最保守）
+  # ================================
+  test:
+    # 通道处理
+    - EnsureChannelFirstd:
+        keys: ["Image", "Mask"]
+        channel_dim: "no_channel"
+
+    # 更宽松的百分位归一化：保留更多信息
+    - ScaleIntensityRangePercentilesd:
+        keys: ["Image"]
+        lower: 2                     # 保留更多低强度信息
+        upper: 98                    # 保留更多高强度信息
+        b_min: 0
+        b_max: 1
+
+    # 张量转换
+    - ToTensord:
+        keys: [Image, Mask]

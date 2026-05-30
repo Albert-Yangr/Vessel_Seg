@@ -1,0 +1,45 @@
+# @package _global_
+defaults:
+  - /train
+  - override /data: CAS2023
+  - _self_
+
+seed: 42
+data_name: ${data}
+loss_name: lpmoe-PEFT-深层监督微调
+
+path_to_chkpt: /home/yangrui/Project/Base-model/local_results/checkpoints/base.pt
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+
+devices: [4,5]
+label_suffix: ".label.nii.gz"
+
+batch_size: 2
+repeats: 100
+
+# 🔥 新增：分层学习率倍率控制 (Discriminative Learning Rates)
+lr_multipliers:
+  encoder: 0.1   # 基础主干 (通用支路)：极小学习率，防止遗忘大模型先验，但允许微调突破上限
+  decoder: 1.0   # 解码器：正常学习率，适应当前数据集的局部形态
+  expert:  3.0  # DMLP与BDI专家支路：激进学习率，加速并行专家的收敛，专门攻克困难断点
+
+lr: 0.0001 # 配合余弦退火，初始给一个标准的学习率即可
+
+loss_configs:
+  label_loss:
+    _target_: utils.mutil_supervision.label_loss.FullLabelLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+    cldice_weight: 0.5
+
+trainer:
+  lightning_trainer:
+    max_epochs: 200 # 200轮足够余弦调度器下探到最深处
+    val_check_interval: 1.0
+    log_every_n_steps: 10
+
+  lightning_module:
+    _target_: utils.mutil_supervision.module.WeakPLModule
+    _partial_: True
+    prediction_threshold: 0.5
+    loss: null

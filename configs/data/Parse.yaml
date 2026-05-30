@@ -1,0 +1,7 @@
+defaults:
+  - default_finetune@Parse
+  - _self_
+
+Parse:
+  sample_prop: 1
+  path: /home/yangrui/Project/Base-model/datasets/Parse/Parse-reshape

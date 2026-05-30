@@ -1,0 +1,57 @@
+# @package _global_
+# 使用 Hydra 的默认值机制，按顺序加载 train.yaml 和 eval_smile.yaml 中的配置
+defaults:
+  - /train
+  - override /data: imageCAS  # 添加 override 关键字
+  - _self_         # 当前文件的配置拥有最高优先级
+
+seed: 42
+
+# 实验参数配置
+num_shots: 3       # 零样本模式：直接使用预训练模型进行推理，不进行微调
+lr: 0.00001         # 学习率设置（10^-5），适用于零样本评估的优化器初始化
+devices: [1,0]       # 使用单个 GPU（设备索引 0）进行计算
+
+data_name:  imageCAS   # 实验运行名称，用于日志记录和模型保存路径标识
+loss_name:  LPMoE
+
+# 路径配置
+path_to_chkpt: /home/yangrui/Project/Base-model/local_results/checkpoints/imageCAS/imageCAS-few/Frozen_LPMoE_3shot_imageCAS-few/step:3000_val_DiceMetric:0.71_2GPUs.ckpt
+
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+
+# 数据加载器配置
+dataloader:
+  shuffle: False
+
+# 训练器配置
+trainer:
+  lightning_trainer:
+    val_check_interval: 300
+    max_steps: 15000
+    max_epochs: 1
+
+  # 【关键修改】指向新的 LPMoE 专用模块
+  lightning_module:
+    _target_: model.lpmoe_module.LPMoEModuleFinetune
+    _partial_: True
+    prediction_threshold: 0.62
+    batch_size: ${batch_size}
+    input_size: ${input_size}
+    aux_weight: 0.4  # 新增：辅助损失权重
+
+    # 学习率调度器配置
+    scheduler_configs:
+      cosine_annealing_few:
+        interval: step
+        frequency: 10
+        scheduler:
+          _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          _partial_: True
+          T_max: 1000
+          eta_min: 0.0000001
+          last_epoch: -1
+
+      linear_warmup: null
+      cosine_annealing: null

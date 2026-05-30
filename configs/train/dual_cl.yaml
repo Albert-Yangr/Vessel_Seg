@@ -1,0 +1,81 @@
+# @package _global_
+defaults:
+  - /trainer: default
+  - /hydra: default
+  - /model: dyn_unet_base
+  - /data: Parse
+  - _self_
+
+data_name: Parse
+loss_name: 新平衡版本
+seed: 43
+
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+experiment_record_root: /home/yangrui/Project/Base-model/local_results/experiments
+path_to_chkpt: null
+resume_ckpt_path: null
+
+
+
+label_suffix: ".slice.nii.gz"
+input_size: [128, 128, 128]
+val_frequency: 2000
+batch_size: 2
+repeats: 10
+ramp_epochs: 100  # 设为 0 表示关闭 ramp-up，伪标签损失从一开始直接使用 pseudo_weight
+pseudo_weight: 0.5
+pseudo_label_mode: hard  # hard=传统 CPS 二值伪标签；soft=两个分支概率随机混合的软伪标签
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+loss_configs:
+  label_loss:
+    _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+  slice_loss:
+    _target_: utils.dual_branch.simple_loss.SparseSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+    affinity_weight: 0
+    tv_weight: 0
+    ignore_index: 255
+  pseudo_loss:
+    _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+
+# 🌟 核心修正：极简统一的对比学习超参数配置
+  contrastive:
+    enable: true
+    weight: 0.5
+    warmup_epochs: 20       # 前20轮只更新原型，不计算无标签的CL
+    temperature: 0.1        # InfoNCE 温度
+    feat_dim: 32            # 网络倒数第二层特征维度
+    patch_size: 16          # 🌟 统一尺寸：GT和伪标签全部使用 2D 的 16x16 切片框进行对齐
+    num_patches: 16         # 每张图采样的血管/背景锚点数
+
+# === 训练器底层配置 ===
+trainer:
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True
+    max_epochs: 100
+    max_time: "00:48:00:00"
+    max_steps: -1
+    accelerator: gpu
+    devices: [1]
+    precision: 16-mixed
+    check_val_every_n_epoch: null
+    num_sanity_val_steps: 0
+
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  num_workers: 8
+  batch_size: ${batch_size}
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 2

@@ -1,0 +1,97 @@
+# @package _global_
+defaults:
+  # 加上 '/' 代表绝对路径，强制 Hydra 从 configs 根目录开始寻找这些基础组件
+  - /hydra: default             # 继承日志和工作目录的路径配置
+  - /model: dyn_unet_base       # 继承纯净的 3D UNet 网络架构配置
+  - /data: CAS2023             # 继承数据集路径和数据增强流水线 (default_finetune.yaml)
+  - _self_                      # _self_ 放在最后，表示当前文件里的参数优先级最高，会覆盖上面继承来的同名参数
+
+# =========================================================================
+# 1. 基础实验信息与硬件配置
+# =========================================================================
+seed: 42                       # 全局随机种子。固定后，每次跑的数据打乱顺序、网络权重初始化都完全一样，保证实验可复现。
+data_name: CAS2023            # 数据集名称标识，常用于拼接保存路径或作为验证指标的前缀（如 imageCAS_val_dice）。
+loss_name: 随机-少样本标签5     # 自定义实验名，会作为 Wandb 曲线的名字和本地权重文件夹的名字，方便对比不同跑批。
+
+# 预训练权重路径。如果填入 .pt/.pth，模型会在初始化后加载它；留空 (null) 则表示网络从头随机初始化。
+path_to_chkpt: null
+
+resume_ckpt_path: null
+
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints # 模型最终保存的主目录
+
+devices: [1]
+
+
+# =========================================================================
+# 2. 核心训练超参数 & 数据参数
+# =========================================================================
+# === 核心模式开关 ===
+# - 填 ".label.nii.gz" -> 触发全监督真实标签模式
+# - 填 ".slice.nii.gz" -> 触发切片弱监督模式 (只有部分层有标签)
+label_suffix: ".label.nii.gz"
+input_size: [128, 128, 128]    # 3D 随机裁剪的输入 Patch 尺寸。这个变量会被底层的 default_finetune.yaml 里的增强算子自动引用。
+batch_size: 2                  # 单张显卡的 Batch Size。两张卡等效全局 Batch Size 为 4。
+repeats: 160                      # 数据集重采样放大倍数。
+# =========================================================================
+# 3. 损失函数配置库 (动态挂载)
+# =========================================================================
+loss_configs:
+  # ---------------- 全监督损失配置 ----------------
+  label_loss:
+    _target_: utils.mutil_supervision.label_loss.FullLabelLoss
+    dice_weight: 0.9           # Dice 损失权重：主导血管交并比的优化，能很好地对抗“背景多、血管少”的极度类别不平衡。
+    ce_weight: 0.1             # BCE 交叉熵权重：提供平滑的像素级分类梯度，帮助收敛。
+    cldice_weight: 0           # clDice 中心线拓扑损失权重：设为 0 表示关闭。如果预测的血管经常断裂，可设为 0.5 开启骨架连通性惩罚。
+  # ---------------- 切片弱监督损失配置 ----------------
+  slice_loss:
+    _target_: utils.mutil_supervision.slice_loss.SparseSliceLoss
+    bce_weight: 0.9            # 在【有标注的切片】上，强迫像素分类准确的权重。
+    dice_weight: 0.1           # 在【有标注的切片】上，计算局部的形状交并比。
+    affinity_weight: 0         # 3D 亲和力扩散权重：如果开启(如设为10)，会利用原图的灰度相似性，引导已知血管向【未标注区域】蔓延。
+    tv_weight: 0               # Total Variation 全变分损失：用于全局平滑去噪，防止模型在未标注区域瞎猜出斑点。
+    ignore_index: 255          # 忽略标签值
+
+# =========================================================================
+# 4. 训练器与模型挂载配置
+# =========================================================================
+trainer:
+  # ---------------- 底层 PyTorch Lightning Trainer 配置 ----------------
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True             # 告诉 Hydra 先别急着完全实例化，因为像 logger, callbacks 等参数会在 Python 代码里才传给它。
+    max_epochs: 100             # 训练的最大总轮数。
+    # 如果填浮点数 (如 1.0) -> 表示每跑完 100% 的当前 Epoch 数据，做一次验证。
+    # 如果填整数 (如 112) -> 表示无视 Epoch 进度，每隔 112 个训练 Step (步) 就强行做一次验证。
+    # 你的数据如果比较少，设为整数可以让你更频繁地看到模型能力的变化。
+    val_check_interval: 2000
+    check_val_every_n_epoch: null
+    log_every_n_steps: 10       # 每隔 10 步在终端和 Wandb 上打印一次训练 Loss，防止日志刷屏。
+    accelerator: gpu            # 指定使用 GPU 加速。
+    precision: 16-mixed         # 开启 AMP (自动混合精度)。极大地降低显存占用，并利用 Tensor Core 加速训练，几乎不损失精度。
+    enable_checkpointing: True  # 允许回调函数保存模型权重。
+    num_sanity_val_steps: 0
+  # ---------------- 顶层业务逻辑模块 WeakPLModule 配置 ----------------
+  lightning_module:
+    _target_: utils.mutil_supervision.module.WeakPLModule
+    _partial_: True             # 同样是部分实例化，因为 model 实例在 Python 代码里才建好并传进来。
+    prediction_threshold: 0.5   # 验证和测试时，将连续的预测概率 (0~1) 二值化为明确血管 (1) 或背景 (0) 的界限。
+    loss: null                  # 占位符。在 mutil_train.py 里，会根据 label_suffix 自动把上面的 label_loss 或 slice_loss 填到这里。
+
+    # 传给 configure_optimizers 的配置
+    optimizer_config:
+      lr: 0.0001                # AdamW 优化器的最大学习率。
+      weight_decay: 1e-5        # L2 正则化衰减系数，稍微加一点可以防止网络在血管分割这种小数据集上过拟合。
+
+# =========================================================================
+# 5. 高性能数据加载器配置 (DataLoader)
+# =========================================================================
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  _partial_: True
+  num_workers: 32               # 开启 16 个 CPU 子进程同时去硬盘读图和做数据增强，防止 GPU 饿着肚子等数据。
+  prefetch_factor: 3            # 每个子进程提前准备好 3 个 Batch 的数据存在内存里排队。
+  batch_size: ${batch_size}     # 动态引用上面定义的 batch_size: 2
+  pin_memory: True              # 开启锁页内存。把 CPU 内存中的数据转移到 GPU 显存时，速度会大幅提升。
+  persistent_workers: True      # 每个 Epoch 结束后，不销毁那 16 个 CPU 子进程，下个 Epoch 直接复用，省去了进程创建的开销。

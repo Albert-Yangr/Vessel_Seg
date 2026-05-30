@@ -1,0 +1,9 @@
+defaults:
+  - default_finetune@imageCAS
+  - _self_
+
+imageCAS:
+  sample_prop: 1
+  path: /home/yangrui/Project/Base-model/datasets/imageCAS/imageCAS-origin
+
+

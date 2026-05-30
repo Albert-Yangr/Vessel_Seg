@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="fa5c371e-f0c8-4f1e-a95d-7ca8c02da29a" name="base-model">
+        <fileTransfer rootFolder="/home/yangrui/Project/Base-model" accessType="SFTP" host="211.87.232.154" port="22" sshConfigId="24ac9968-dea9-4933-aa21-37f554218ba9" sshConfig="yangrui@211.87.232.154:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

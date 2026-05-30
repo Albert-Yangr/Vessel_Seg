@@ -1,0 +1,129 @@
+# @package _global_
+defaults:
+  - /train
+  - override /data: Parse
+  - _self_
+
+seed: 42
+# 全量训练参数
+data_name: Parse
+loss_name: 测试
+path_to_chkpt: /home/yangrui/Project/Base-model/local_results/checkpoints/base.pt
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+devices: [2, 3]
+
+# 训练超参数
+lr: 0.0001
+batch_size: 4
+repeats: 800   #每个样本裁剪几次
+# ================= 训练器配置 =================
+trainer:
+  lightning_trainer:
+    max_epochs: 100              # 最大Epochs
+    check_val_every_n_epoch: 1  # 每 10 个 Epoch 验证一次 (避免等待太久)
+
+    max_steps: -1
+    val_check_interval: 1.0
+    log_every_n_steps: 10        # 打印频率
+
+  lightning_module:
+    _target_: model.module.PLModuleFinetune
+    _partial_: True
+    prediction_threshold: 0.5
+    batch_size: ${batch_size}
+    input_size: [128, 128, 128]
+
+    scheduler_configs:
+      cosine_annealing:
+        interval: epoch
+        frequency: 1
+        scheduler:
+          _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          _partial_: True
+          T_max: ${trainer.lightning_trainer.max_epochs}
+          eta_min: 1e-6
+          last_epoch: -1
+
+      cosine_annealing_few: null
+      linear_warmup: null
+
+
+
+
+
+# ================= 数据增强与预处理 =================
+data:
+  Parse:
+    transforms:
+      train:
+        - EnsureChannelFirstd:
+            keys: ["Image", "Mask"]
+            channel_dim: "no_channel"
+        - ScaleIntensityRangePercentilesd:
+            keys: ["Image"]
+            lower: 1
+            upper: 99
+            b_min: 0
+            b_max: 1
+            clip: true
+
+        # --- 新增：填充 ---
+        # 防止图像小于 128x128x128 导致 RandCrop 报错
+        - SpatialPadd:
+            keys: ["Image", "Mask"]
+            spatial_size: [128, 128, 128]
+            method: "symmetric"
+
+        # --- 随机裁剪 ---
+        - RandCropByPosNegLabeld:
+            keys: ["Image", "Mask"]
+            label_key: "Mask"
+            spatial_size: [128, 128, 128]
+            pos: 1
+            neg: 1
+            num_samples: 1 # 保持为 1，数量扩充由 Dataset 的 repeats=8 实现
+            image_key: "Image"
+            image_threshold: 0
+
+        # --- 空间增强 ---
+        - RandFlipd:
+            keys: ["Image", "Mask"]
+            prob: 0.5
+            spatial_axis: [0, 1, 2]
+        - RandRotate90d:
+            keys: ["Image", "Mask"]
+            prob: 0.5
+            spatial_axes: [0, 1]
+        - ToTensord:
+            keys: ["Image", "Mask"]
+            device: null
+
+      val:
+        - EnsureChannelFirstd:
+            keys: ["Image", "Mask"]
+            channel_dim: "no_channel"
+        - ScaleIntensityRangePercentilesd:
+            keys: ["Image"]
+            lower: 1
+            upper: 99
+            b_min: 0
+            b_max: 1
+            clip: true
+        - ToTensord:
+            keys: ["Image", "Mask"]
+            device: null
+
+      test:
+        - EnsureChannelFirstd:
+            keys: ["Image", "Mask"]
+            channel_dim: "no_channel"
+        - ScaleIntensityRangePercentilesd:
+            keys: ["Image"]
+            lower: 1
+            upper: 99
+            b_min: 0
+            b_max: 1
+            clip: true
+        - ToTensord:
+            keys: ["Image", "Mask"]
+            device: null

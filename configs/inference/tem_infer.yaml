@@ -1,0 +1,81 @@
+# @package _global_
+defaults:
+  - /hydra: default
+  - /model: dyn_unet_base
+  - _self_
+
+# --- 多卡配置 ---
+gpus: [0,3,5,7,1,2,4,6]
+
+# --- 【新增】评估开关 ---
+# True: 计算 Dice/NSD 等指标 (需要目录下有对应的 label 文件)
+# False: 只进行推理并保存结果 (不需要 label 文件，速度更快)
+evaluate: true
+
+# --- 输入输出路径配置 ---
+image_path:  auto
+
+output_folder: null
+
+sign: 双分支基线
+
+
+
+# --- 模型权重 ---
+ckpt_path:  /home/yangrui/Project/Base-model/local_results/checkpoints/imageCAS/imageCAS-origin/自适应2_基础/Epoch88-0.6670.ckpt
+
+
+# --- 文件名匹配规则 ---
+image_file_ending: .img.nii.gz
+mask_suffix: .label.nii.gz
+mask_path: "auto"
+
+file_app: ""
+round_to: 2
+strict_matching: true
+
+# --- 滑动窗口设置 ---
+batch_size: 1
+patch_size: [128, 128, 128]
+overlap: 0.5
+mode: "gaussian"
+sigma_scale: 0.125
+padding_mode: "constant"
+
+# 评估和可复现性配置
+seed: 42
+
+# 后处理配置
+post:
+  apply: false
+  small_objects_min_size: 200
+  keep_largest_vessels: false
+  num_largest_vessels: 3
+  keep_closest_vessels: false
+  num_closest_vessels: 3
+
+# 测试时增强配置
+tta:
+  scales: [1]
+  invert: false
+  invert_mean_thresh: 0.5
+  equalize_hist: false
+  hist_bins: 100
+
+# 标准预处理变换管道
+transforms_config:
+  - EnsureChannelFirst:
+      channel_dim: "no_channel"
+  - ScaleIntensityRangePercentiles:
+      lower: 2
+      upper: 98
+      b_min: 0
+      b_max: 1
+      clip: false
+  - ToTensor:
+      device: null
+
+# 多尺度预测结果融合配置
+merging:
+  threshold: 0.5
+  max: false

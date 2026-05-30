@@ -1,0 +1,94 @@
+# @package _global_
+defaults:
+  - /trainer: default
+  - /hydra: default
+  - /model: dyn_unet_base
+  - /data: imageCAS
+  - _self_
+
+data_name: imageCAS
+loss_name: SliceAnchor3D_CL
+seed: 43
+
+chkpt_folder: /home/yangrui/Project/Base-model/local_results/checkpoints
+path_to_chkpt: null
+resume_ckpt_path: null
+
+label_suffix: ".slice.nii.gz"
+input_size: [128, 128, 128]
+val_frequency: 2000
+batch_size: 2
+repeats: 1
+ramp_epochs: 100
+pseudo_weight: 0.5
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+loss_configs:
+  label_loss:
+    _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+  slice_loss:
+    _target_: utils.dual_branch.simple_loss.SparseSliceLoss
+    dice_weight: 0.9
+    bce_weight: 0.1
+    affinity_weight: 0
+    tv_weight: 0
+    ignore_index: 255
+  pseudo_loss:
+    _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
+    dice_weight: 0.9
+    ce_weight: 0.1
+
+  # Original 2D fixed slice-box contrastive learning.
+  contrastive:
+    enable: true
+    weight: 0.2
+    warmup_epochs: 20
+    temperature: 0.1
+    feat_dim: 32
+    patch_size: 16
+    num_patches: 12
+
+  # New module: reliable slice-near 3D cubes guide uncertain unlabeled cubes.
+  volume_contrastive:
+    enable: true
+    weight: 0.1
+    warmup_epochs: 20
+    temperature: 0.1
+    feat_dim: 32
+    cube_size: 16
+    num_anchor_cubes: 8
+    num_uncertain_cubes: 32
+    select_ratio: 0.25
+    proto_momentum: 0.95
+    uncertain_low: 0.35
+    uncertain_high: 0.65
+    disagreement_thr: 0.2
+    min_score_margin: 0.0
+    min_class_voxels: 1
+    ignore_index: 255
+
+trainer:
+  lightning_trainer:
+    _target_: lightning.pytorch.trainer.trainer.Trainer
+    _partial_: True
+    max_epochs: 100
+    max_time: "00:48:00:00"
+    max_steps: -1
+    accelerator: gpu
+    devices: [4]
+    precision: 16-mixed
+    check_val_every_n_epoch: null
+    num_sanity_val_steps: 0
+
+dataloader:
+  _target_: "torch.utils.data.DataLoader"
+  num_workers: 8
+  batch_size: ${batch_size}
+  pin_memory: True
+  persistent_workers: True
+  prefetch_factor: 1
