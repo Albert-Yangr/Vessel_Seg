@@ -160,11 +160,22 @@ class MutilSupervisionDataset(Dataset):
         作为 DualStreamDataset 的 labeled_dataset，用于监督损失 loss_sup。
     """
 
-    def __init__(self, dataset_configs, mode, finetune=False, repeats=1, label_suffix=".pred.nii.gz"):
+    def __init__(
+        self,
+        dataset_configs,
+        mode,
+        finetune=False,
+        repeats=1,
+        label_suffix=".pred.nii.gz",
+        min_valid_label_pixels=1,
+        max_crop_retries=20,
+    ):
         super().__init__()
         self.finetune = finetune
         self.repeats = repeats
         self.label_suffix = label_suffix
+        self.min_valid_label_pixels = int(min_valid_label_pixels)
+        self.max_crop_retries = int(max_crop_retries)
         self.datasets = []
         self.len = 0
 
@@ -257,7 +268,7 @@ class MutilSupervisionDataset(Dataset):
         dataset = self.datasets[dataset_id]
 
         retry_count = 0
-        while retry_count < 10:
+        while retry_count < self.max_crop_retries:
             real_len = len(dataset["samples"])
             # finetune/validation 风格使用顺序取样；训练风格使用随机取样。
             data_idx = idx % real_len if self.finetune else torch.randint(0, real_len, (1,)).item()
@@ -273,29 +284,42 @@ class MutilSupervisionDataset(Dataset):
                 transformed = dataset["transforms"]({"Image": img, "Mask": mask})
                 if isinstance(transformed, list):
                     transformed = transformed[0]
-                return transformed["Image"], transformed["Mask"]
+
+                out_img = transformed["Image"]
+                out_mask = transformed["Mask"]
+
+                # 切片弱监督标签非常稀疏，普通随机裁剪可能完全裁不到标注切片。
+                # 训练阶段要求 labeled crop 至少包含一些非 255 的有效标注区域，
+                # 否则这个 labeled crop 实际上退化成无标签样本，监督信号会变弱。
+                if not self.finetune and self.min_valid_label_pixels > 0:
+                    valid_pixels = (out_mask != 255).sum().item()
+                    if valid_pixels < self.min_valid_label_pixels:
+                        retry_count += 1
+                        idx = torch.randint(0, self.virtual_len, (1,)).item()
+                        continue
+
+                return out_img, out_mask
             except Exception:
                 idx = torch.randint(0, self.virtual_len, (1,)).item()
                 retry_count += 1
 
-        raise RuntimeError("Failed to load labeled data after multiple retries.")
+        raise RuntimeError(
+            "Failed to load a labeled crop with valid annotation after multiple retries. "
+            "Consider lowering min_valid_label_pixels or checking slice labels."
+        )
 
 
 class DualStreamDataset(Dataset):
     """
     双流配对数据集。
-
     作用：
         将一个有标签样本和一个无标签样本打包成一个训练样本：
-
             {
                 "labeled": labeled_sample,
                 "unlabeled": unlabeled_sample
             }
-
     长度策略：
         由无标签流决定 epoch 长度。这样可以让无标签数据得到充分利用。
-
     有标签采样：
         cycle:  idx % labeled_len，循环使用有标签样本。
         random: 每次随机抽一个有标签样本。
@@ -332,14 +356,9 @@ class DualStreamDataset(Dataset):
 class UnionDataset(Dataset):
     """
     验证/测试数据集。
-
-    作用：
-        读取完整图像和完整 label，用于 validation_step 中的滑窗推理和 Dice 计算。
-
-    返回：
-        (Image, Mask > 0)
+    作用： 读取完整图像和完整 label，用于 validation_step 中的滑窗推理和 Dice 计算。
+    返回： (Image, Mask > 0)
     """
-
     def __init__(self, dataset_configs, mode, finetune=False, repeats=1):
         super().__init__()
         self.finetune = finetune
@@ -347,13 +366,11 @@ class UnionDataset(Dataset):
         self.datasets = []
         self.len = 0
         probs = []
-
         for name, dataset_config in dataset_configs.items():
             data_dir = Path(dataset_config.path) / mode if finetune else Path(dataset_config.path)
             if not data_dir.exists():
                 logger.warning(f"Validation/test data dir not found, skipped: {data_dir}")
                 continue
-
             paths = sorted([p for p in data_dir.iterdir() if p.is_dir()])
             self.len += len(paths)
             self.datasets.append(

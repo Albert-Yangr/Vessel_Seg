@@ -52,35 +52,40 @@ class SimpleSliceLoss(nn.Module):
 class SimplePseudoLoss(nn.Module):
     """
     无标签伪标签损失。
-
     输入：
-        preds:
-            当前分支对无标签图像的 logits。
-        target:
-            伪标签，可以是 hard 0/1，也可以是 soft probability map。
-
+        preds: 当前分支对无标签图像的 logits。
+        target: 伪标签，可以是 hard 0/1，也可以是 soft probability map。
+        valid_mask: 可选区域 mask。None 表示全图计算；传入 mask 时只在 mask=1 的区域计算。
     当前配置中 dice_weight=0.9, ce_weight=0.1，因此 Dice 是主项，BCE 是辅助项。
     """
-
     def __init__(self, dice_weight=1.0, ce_weight=0.0):
         super().__init__()
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
-        self.bce_func = nn.BCEWithLogitsLoss()
+        self.bce_func = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, preds, target):
+    def forward(self, preds, target, valid_mask=None):
         target = target.float()
+        if valid_mask is None:
+            valid_mask = torch.ones_like(target, dtype=target.dtype, device=target.device)
+        else:
+            valid_mask = valid_mask.float().to(device=target.device, dtype=target.dtype)
+
+        valid_count = valid_mask.sum()
+        if valid_count <= 0:
+            return preds.sum() * 0.0
 
         loss_dice = 0.0
         if self.dice_weight > 0:
             pred_prob = torch.sigmoid(preds)
-            intersection = (pred_prob * target).sum()
-            denominator = pred_prob.sum() + target.sum()
+            intersection = (pred_prob * target * valid_mask).sum()
+            denominator = (pred_prob * valid_mask).sum() + (target * valid_mask).sum()
             loss_dice = 1.0 - (2.0 * intersection + 1e-5) / (denominator + 1e-5)
 
         loss_ce = 0.0
         if self.ce_weight > 0:
-            loss_ce = self.bce_func(preds, target)
+            ce_pixel = self.bce_func(preds, target)
+            loss_ce = (ce_pixel * valid_mask).sum() / (valid_count + 1e-6)
 
         return self.dice_weight * loss_dice + self.ce_weight * loss_ce
 
@@ -88,25 +93,21 @@ class SimplePseudoLoss(nn.Module):
 class SparseSliceLoss(nn.Module):
     """
     切片弱监督损失。
-
     适用场景：
         3D 图像中只有少数 2D 切片被标注，未标注区域用 ignore_index=255 表示。
-
     核心逻辑：
         1. 监督项：只在 slice_label != ignore_index 的区域计算 BCE + Dice。
         2. affinity 项：鼓励原图灰度相近的相邻体素预测也相近。
         3. TV 项：对预测概率做全变分平滑，抑制噪点。
-
     当前 dual_train.yaml 中 affinity_weight=0, tv_weight=0，因此实际只启用
     标注切片上的 BCE + Dice。
     """
-
     def __init__(
         self,
         bce_weight=1.0,
         dice_weight=1.0,
-        affinity_weight=10.0,
-        tv_weight=0.1,
+        affinity_weight=0,
+        tv_weight=0,
         ignore_index=255,
         **kwargs,
     ):
@@ -122,16 +123,12 @@ class SparseSliceLoss(nn.Module):
 
     def forward(self, pred_logits, slice_label, images):
         """
-        pred_logits:
-            模型输出 logits。
-        slice_label:
-            稀疏切片标签，0=背景，1=血管，255=未知区域。
-        images:
-            原图，用于可选 affinity loss。
+        pred_logits:模型输出 logits。
+        slice_label:稀疏切片标签，0=背景，1=血管，255=未知区域。
+        images:原图，用于可选 affinity loss。
         """
         valid_mask = (slice_label != self.ignore_index).float()
         target = (slice_label == 1).float()
-
         bce_pixel = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
 
         if valid_mask.sum() > 0:

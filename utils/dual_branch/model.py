@@ -5,7 +5,6 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-
 class DualStreamDynUNet(nn.Module):
     """
     双分支 DynUNet 封装。
@@ -14,11 +13,9 @@ class DualStreamDynUNet(nn.Module):
     - encoder、bottleneck 共享。
     - 主分支 decoder 使用 base_model 原始 decoder。
     - 辅助分支 decoder 复制一份原始 decoder，并重新初始化。
-
     训练阶段：
         forward(x) -> (out1, out2)
         两个输出分别进入监督损失和伪标签损失。
-
     验证/测试阶段：
         forward(x) -> base_model(x)
         只返回单分支结果，方便 MONAI sliding_window_inference。
@@ -44,10 +41,7 @@ class DualStreamDynUNet(nn.Module):
     def _reinit_aux_decoder(self):
         """
         重新初始化辅助 decoder。
-
-        如果辅助 decoder 只是原样复制主 decoder，两个分支初始输出会非常接近，
-        CPS 的互监督信号容易退化。这里使用 Kaiming 初始化，让辅助分支具有
-        独立起点。
+        使用 Kaiming 初始化，让辅助分支具有独立起点。
         """
         for m in self.aux_upsamples.modules():
             if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
@@ -64,13 +58,11 @@ class DualStreamDynUNet(nn.Module):
     def forward(self, x):
         """
         前向传播。
-
         训练时手动展开 base_model 的 encoder / decoder，以得到双分支输出。
         验证时直接调用 base_model，避免 sliding-window 推理接收到 tuple。
         """
         if not self.training:
             return self.base_model(x)
-
         # 1. 共享 encoder，保存 skip features 供两个 decoder 使用。
         in_layer = self.base_model.input_block(x)
         skips = [in_layer]

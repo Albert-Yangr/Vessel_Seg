@@ -165,6 +165,8 @@ def main(cfg):
         mode="train",
         repeats=cfg.repeats,
         label_suffix=cfg.label_suffix,
+        min_valid_label_pixels=cfg.get("min_valid_label_pixels", 1),
+        max_crop_retries=cfg.get("max_labeled_crop_retries", 20),
     )
     unlabeled_ds = UnlabeledWeakDataset(
         unlabeled_configs,

@@ -3,13 +3,15 @@
 # =============================================================================
 # 基础双分支 CPS 训练配置
 # -----------------------------------------------------------------------------
-# 这份配置对应 train/dual_train.py。
 # 当前实验设置：
 #   - 数据集：Parse
 #   - 监督形式：切片弱监督标签 .slice.nii.gz
 #   - 半监督方法：Dual-Branch CPS
 #   - 伪标签模式：soft pseudo label
 #   - ramp-up：关闭，也就是冷启动
+#   - 伪标签损失区域：
+#       * 无标签样本：全区域参与 CPS
+#       * 有切片弱标注样本：仅 mask == 255 的未标注区域参与 CPS
 # =============================================================================
 
 defaults:
@@ -25,8 +27,7 @@ defaults:
 data_name: Parse
 loss_name: 软标签-冷启动
 seed: 43
-
-experiment_note: "测试基础 CPS 使用软伪标签且关闭 ramp-up 的效果"
+experiment_note: "测试基础 CPS 使用软伪标签、关闭 ramp-up，并在弱标注样本未标注区域加入伪标签损失。"
 
 # -----------------------------------------------------------------------------
 # 路径设置
@@ -39,14 +40,19 @@ resume_ckpt_path: null
 # -----------------------------------------------------------------------------
 # 核心训练超参数
 # -----------------------------------------------------------------------------
-label_suffix: ".slice.nii.gz"   # 使用切片弱监督标签
+label_suffix: ".slice.nii.gz"
 input_size: [128, 128, 128]
 val_frequency: 2000
 batch_size: 2
 repeats: 10
 
-# ramp_epochs=0 表示关闭 ramp-up。
-# 当前总损失为：loss_sup + pseudo_weight * loss_ps。
+# 有标签流随机裁剪约束。
+# min_valid_label_pixels > 0 时，要求 labeled crop 至少包含这些非 255 的有效标注像素。
+# 这可以避免切片弱监督样本随机裁到完全没有标注切片的位置。
+min_valid_label_pixels: 1
+max_labeled_crop_retries: 20
+
+# ramp_epochs=0 表示关闭 ramp-up，伪标签损失从训练开始直接使用 pseudo_weight。
 ramp_epochs: 0
 pseudo_weight: 0.5
 
@@ -65,15 +71,13 @@ optimizer:
 # 损失函数配置
 # -----------------------------------------------------------------------------
 loss_configs:
-  # 完整标签或普通标签监督损失。
   label_loss:
     _target_: utils.dual_branch.simple_loss.SimpleSliceLoss
     dice_weight: 0.9
     bce_weight: 0.1
 
-  # 切片弱监督损失。
-  # 因为 label_suffix=".slice.nii.gz"，dual_train.py 会选择这个损失。
-  # 当前 affinity_weight=0, tv_weight=0，因此实际只使用有效切片区域上的 Dice+BCE。
+  # 因为 label_suffix=".slice.nii.gz"，dual_train.py 会选择 slice_loss。
+  # 当前 affinity_weight=0, tv_weight=0，因此监督项实际为有效切片区域上的 Dice+BCE。
   slice_loss:
     _target_: utils.dual_branch.simple_loss.SparseSliceLoss
     dice_weight: 0.9
@@ -82,7 +86,6 @@ loss_configs:
     tv_weight: 0
     ignore_index: 255
 
-  # 无标签伪标签损失。
   pseudo_loss:
     _target_: utils.dual_branch.simple_loss.SimplePseudoLoss
     dice_weight: 0.9
@@ -99,7 +102,7 @@ trainer:
     max_time: "00:48:00:00"
     max_steps: -1
     accelerator: gpu
-    devices: [5]
+    devices: [0]
     precision: 16-mixed
     check_val_every_n_epoch: null
     num_sanity_val_steps: 0
@@ -107,8 +110,6 @@ trainer:
 # -----------------------------------------------------------------------------
 # DataLoader
 # -----------------------------------------------------------------------------
-# 当前 3D 医学图像读取和随机裁剪较重，num_workers=8, prefetch_factor=3
-# 能让数据预取队列更深，减少 GPU 等数据的卡顿。
 dataloader:
   _target_: "torch.utils.data.DataLoader"
   num_workers: 8

@@ -47,11 +47,9 @@ class DualBranchPLModule(LightningModule):
     def training_step(self, batch, batch_idx):
         """
         单个训练 step。
-
         batch 来自 DualStreamDataset，结构为：
             batch["labeled"]   -> 有标签/弱监督样本
             batch["unlabeled"] -> 无标签样本
-
         训练逻辑：
             1. 有标签图像送入双分支模型，得到 preds_l=(pred1_l, pred2_l)。
             2. 无标签图像送入双分支模型，得到 preds_u=(pred1_u, pred2_u)。
@@ -59,10 +57,8 @@ class DualBranchPLModule(LightningModule):
         """
         batch_l = batch["labeled"]
         batch_u = batch["unlabeled"]
-
         img_l, mask_l = self._unpack_batch(batch_l)
         img_u, _ = self._unpack_batch(batch_u)
-
         preds_l = self.model(img_l)
         preds_u = self.model(img_u)
 
@@ -73,7 +69,6 @@ class DualBranchPLModule(LightningModule):
             current_epoch=self.current_epoch,
             img_l=img_l,
         )
-
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         self.log("loss_sup", loss_sup, prog_bar=False, sync_dist=True)
         self.log("loss_ps", loss_ps, prog_bar=False, sync_dist=True)
@@ -107,7 +102,6 @@ class DualBranchPLModule(LightningModule):
     def validation_step(self, batch, batch_idx):
         """
         验证 step。
-
         验证阶段模型处于 eval 模式，因此 DualStreamDynUNet 只返回 base_model 的
         单分支输出。这里使用 MONAI sliding_window_inference 处理 3D 大图。
         """
@@ -120,7 +114,6 @@ class DualBranchPLModule(LightningModule):
             predictor=self.model,
             overlap=0.5,
         )
-
         val_preds = (torch.sigmoid(val_outputs) > self.threshold).float()
         self.val_dice(y_pred=val_preds, y=gt_masks)
         self.val_step_count += 1
@@ -171,7 +164,6 @@ class DualBranchPLModule(LightningModule):
     def configure_optimizers(self):
         """
         优化器和学习率调度。
-
         当前使用 AdamW + CosineAnnealingLR。
         lr 和 weight_decay 来自 dual_train.yaml 的 optimizer 配置。
         """
